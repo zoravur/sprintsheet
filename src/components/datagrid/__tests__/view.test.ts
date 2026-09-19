@@ -5,16 +5,19 @@ async function gridSource(): Promise<string> {
 }
 
 /**
- * Regression guard for a real bug: the grid used to translate keys in TWO
- * places — the editor `<input>` and the wrapper. Committing an edit clears the
- * `editing` state synchronously, so once the input's handler had run, the same
- * event bubbled to the wrapper's handler with its `if (editing) return` guard
- * no longer tripping, and the navigation executed a *second* time. Pressing
- * Tab while editing therefore jumped two cells and skipped one.
+ * Tripwire for a bug whose real fix was architectural.
  *
- * The fix was structural (a single handler), so the guard is structural too. It
- * is not behavioural — catching that needs a DOM test — but it fails loudly the
- * moment a second keydown handler is added back alongside the first.
+ * The grid used to answer "what does Tab do?" in two places: the editor's
+ * onKeyDown (`commitEdit(); scan()`) and the wrapper's (`scan()`). Committing
+ * clears `editing` synchronously, so the same event bubbled on with the
+ * wrapper's `if (editing) return` guard no longer tripping, and navigated a
+ * second time — Tab in edit mode jumped two cells.
+ *
+ * Folding edit mode into the model removed the reason for two answers: the view
+ * now only says which keys the field keeps, and the model decides that a
+ * navigation ends the edit. This test guards the resulting *shape* — one
+ * keydown handler — which is weaker than guarding the cause. It is not
+ * behavioural; a DOM test would cover that.
  */
 describe("keydown handling lives in exactly one place", () => {
   test("CanvasDataGrid binds onKeyDown exactly once", async () => {

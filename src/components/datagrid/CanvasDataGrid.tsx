@@ -595,16 +595,20 @@ export function CanvasDataGrid<Row>({
 
   /**
    * Translate a key event into a command, or `null` to let the browser/field
-   * keep it. While editing, the field owns text entry, the arrow keys and
-   * Delete/Backspace — everything else maps to a command, and the model commits
-   * the edit before applying it.
+   * keep it.
    *
-   * There is deliberately exactly ONE keydown handler in this component (the
-   * wrapper's `handleKeyDown`). An earlier version also handled keys on the
-   * editor field; because committing clears `editing` synchronously, the same
-   * event then bubbled here with the guard no longer tripping, so the
-   * navigation ran a second time — pressing Tab while editing skipped a cell.
-   * Adding a second handler brings that back.
+   * Everything about *what a key means* lives here and in the model, never in a
+   * second place. The view's only edit-specific knowledge is which keys the
+   * field keeps (returned as `null`); that a navigation ends the edit is the
+   * model's `ENDS_EDIT` rule. Edit mode therefore doesn't split the view into
+   * two regimes, so there is exactly one keydown handler.
+   *
+   * That shape is what killed the old "Tab while editing skips a cell" bug.
+   * Back then the editor owned "Tab = commit then scan" while the wrapper kept
+   * an `if (editing) return` guard; committing clears `editing` synchronously,
+   * so the same event bubbled on and navigated a second time. Deleting the
+   * extra handler was a *consequence* of moving the policy into the model — the
+   * principled change is what removed the bug, not the deletion.
    */
   const commandForKeyDown = (event: React.KeyboardEvent): Command<Row> | null => {
     const editing = model.getState().editing !== null;
