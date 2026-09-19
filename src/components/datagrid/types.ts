@@ -45,10 +45,25 @@ export interface ColumnDef<Row> {
   locale?: string;
 }
 
-/** A raw selection: `anchor` is where the drag started, `focus` is the active cell. */
+/**
+ * A spreadsheet selection, modelled as three cells:
+ *
+ *  - `anchor` — one corner of the selection rectangle.
+ *  - `extent` — the opposite corner; the rectangle is the bounding box of
+ *    `anchor` and `extent`. The two are interchangeable, so after a pointer
+ *    gesture we normalise `anchor` to the top-left and `extent` to the
+ *    bottom-right.
+ *  - `focus` — the active cell. It may sit anywhere *inside* the rectangle
+ *    (e.g. where a drag started, or where `Enter`/`Tab` navigated to), and it
+ *    is the cell that typing edits.
+ *
+ * Invariant: `focus` is always inside `normalizeSelection(selection)`.
+ */
 export interface SelectionRange {
   anchorRow: number;
   anchorCol: number;
+  extentRow: number;
+  extentCol: number;
   focusRow: number;
   focusCol: number;
 }
@@ -73,16 +88,31 @@ export interface SelectionRect {
 
 export function normalizeSelection(sel: SelectionRange): SelectionRect {
   return {
-    rowMin: Math.min(sel.anchorRow, sel.focusRow),
-    rowMax: Math.max(sel.anchorRow, sel.focusRow),
-    colMin: Math.min(sel.anchorCol, sel.focusCol),
-    colMax: Math.max(sel.anchorCol, sel.focusCol),
+    rowMin: Math.min(sel.anchorRow, sel.extentRow),
+    rowMax: Math.max(sel.anchorRow, sel.extentRow),
+    colMin: Math.min(sel.anchorCol, sel.extentCol),
+    colMax: Math.max(sel.anchorCol, sel.extentCol),
+  };
+}
+
+/** Build a collapsed (single-cell) selection. */
+export function singleCellSelection(row: number, col: number): SelectionRange {
+  return { anchorRow: row, anchorCol: col, extentRow: row, extentCol: col, focusRow: row, focusCol: col };
+}
+
+/** Clamp a cell back inside a rectangle (used to keep `focus` valid). */
+export function clampToRect(rect: SelectionRect, row: number, col: number): { row: number; col: number } {
+  return {
+    row: Math.max(rect.rowMin, Math.min(rect.rowMax, row)),
+    col: Math.max(rect.colMin, Math.min(rect.colMax, col)),
   };
 }
 
 export const EMPTY_SELECTION: SelectionRange = {
   anchorRow: 0,
   anchorCol: 0,
+  extentRow: 0,
+  extentCol: 0,
   focusRow: 0,
   focusCol: 0,
 };

@@ -19,12 +19,15 @@ import { cn } from "@/lib/utils";
 
 import { compareValues, defaultAlign, parseEditedValue, resolveValue } from "./format";
 import { Axis } from "./layout";
+import { fullGrid, scanCell } from "./navigation";
 import { drawGrid, RESIZE_HANDLE_PX } from "./renderer";
 import { computeThumb, dragScroll, thumbToScroll } from "./scrollbar";
 import { getGridTheme, refreshGridTheme, type GridMetrics, type GridTheme } from "./theme";
 import {
+  clampToRect,
   EMPTY_SELECTION,
   normalizeSelection,
+  singleCellSelection,
   type CellAddress,
   type CellValue,
   type ColumnDef,
@@ -143,6 +146,7 @@ export function CanvasDataGrid<Row>({
   const editingRef = React.useRef<CellAddress | null>(null);
   const resizeColRef = React.useRef(-1);
   const dragRef = React.useRef(false);
+  const dragAnchorRef = React.useRef<CellAddress>({ row: 0, col: 0 });
   const resizeSessionRef = React.useRef<ResizeSession | null>(null);
   const pendingSortRef = React.useRef(-1);
   const selectAllOnFocusRef = React.useRef(true);
@@ -194,15 +198,25 @@ export function CanvasDataGrid<Row>({
     setSelectionState((prev) => {
       const maxRow = Math.max(0, rows.length - 1);
       const maxCol = Math.max(0, columns.length - 1);
+      const anchorRow = Math.min(prev.anchorRow, maxRow);
+      const anchorCol = Math.min(prev.anchorCol, maxCol);
+      const extentRow = Math.min(prev.extentRow, maxRow);
+      const extentCol = Math.min(prev.extentCol, maxCol);
+      const rect = normalizeSelection({ ...prev, anchorRow, anchorCol, extentRow, extentCol });
+      const focus = clampToRect(rect, prev.focusRow, prev.focusCol);
       const next: SelectionRange = {
-        anchorRow: Math.min(prev.anchorRow, maxRow),
-        anchorCol: Math.min(prev.anchorCol, maxCol),
-        focusRow: Math.min(prev.focusRow, maxRow),
-        focusCol: Math.min(prev.focusCol, maxCol),
+        anchorRow,
+        anchorCol,
+        extentRow,
+        extentCol,
+        focusRow: focus.row,
+        focusCol: focus.col,
       };
       if (
         next.anchorRow === prev.anchorRow &&
         next.anchorCol === prev.anchorCol &&
+        next.extentRow === prev.extentRow &&
+        next.extentCol === prev.extentCol &&
         next.focusRow === prev.focusRow &&
         next.focusCol === prev.focusCol
       ) {
@@ -459,6 +473,8 @@ export function CanvasDataGrid<Row>({
       if (
         prev.anchorRow === next.anchorRow &&
         prev.anchorCol === next.anchorCol &&
+        prev.extentRow === next.extentRow &&
+        prev.extentCol === next.extentCol &&
         prev.focusRow === next.focusRow &&
         prev.focusCol === next.focusCol
       ) {
@@ -493,7 +509,7 @@ export function CanvasDataGrid<Row>({
     const col = columns[addr.col];
     const row = sortedView[addr.row];
     if (!col || row === undefined || col.field === undefined) return;
-    applySelection({ anchorRow: addr.row, anchorCol: addr.col, focusRow: addr.row, focusCol: addr.col });
+    applySelection(singleCellSelection(addr.row, addr.col));
     const scroller = scrollerRef.current;
     if (scroller) setScrollState({ x: scroller.scrollLeft, y: scroller.scrollTop });
     selectAllOnFocusRef.current = selectAll;
@@ -511,12 +527,9 @@ export function CanvasDataGrid<Row>({
     requestAnimationFrame(() => wrapperRef.current?.focus());
   };
 
-  const commitEdit = (move?: { dr: number; dc: number }, refocus = true) => {
+  const commitEdit = (refocus = true) => {
     const addr = editingRef.current;
-    if (!addr) {
-      if (move) moveFocus(move.dr, move.dc, false);
-      return;
-    }
+    if (!addr) return;
     editingRef.current = null;
     const col = columns[addr.col];
     const row = sortedView[addr.row];
@@ -535,7 +548,6 @@ export function CanvasDataGrid<Row>({
       }
     }
     setEditing(null);
-    if (move) moveFocus(move.dr, move.dc, false);
     scheduleDraw();
     if (refocus) requestAnimationFrame(() => wrapperRef.current?.focus());
   };
@@ -553,14 +565,48 @@ export function CanvasDataGrid<Row>({
   }, [editing]);
 
   // ---- keyboard -----------------------------------------------------------
+  /**
+   * Arrow-style movement.
+   *  - plain: collapse to the moved focus (a single cell).
+   *  - shift: move the *extent* and keep the anchor, extending the rectangle;
+   *    focus is pulled back inside the new rectangle if the range shrank.
+   */
   const moveFocus = (dr: number, dc: number, extend: boolean) => {
     const sel = selectionRef.current;
-    const row = clampRow(sel.focusRow + dr);
-    const col = clampCol(sel.focusCol + dc);
-    const next: SelectionRange = extend
-      ? { anchorRow: sel.anchorRow, anchorCol: sel.anchorCol, focusRow: row, focusCol: col }
-      : { anchorRow: row, anchorCol: col, focusRow: row, focusCol: col };
-    applySelection(next);
+    if (!extend) {
+      const row = clampRow(sel.focusRow + dr);
+      const col = clampCol(sel.focusCol + dc);
+      applySelection(singleCellSelection(row, col));
+      ensureVisible(row, col);
+      return;
+    }
+    const extentRow = clampRow(sel.extentRow + dr);
+    const extentCol = clampCol(sel.extentCol + dc);
+    const rect = normalizeSelection({ ...sel, extentRow, extentCol });
+    const focus = clampToRect(rect, sel.focusRow, sel.focusCol);
+    applySelection({ ...sel, extentRow, extentCol, focusRow: focus.row, focusCol: focus.col });
+    ensureVisible(extentRow, extentCol);
+  };
+
+  /**
+   * `Enter` (vertical) and `Tab` (horizontal) navigation, with `Shift` to go
+   * backwards. Movement stays inside the selection rectangle and wraps:
+   *  - `Tab`   scans row-major,    wrapping to the next *row*.
+   *  - `Enter` scans column-major, wrapping to the next *column*.
+   *
+   * When the selection is a single cell there is nothing to cycle through, so
+   * the selection itself moves (wrapping across the whole grid).
+   */
+  const scanMove = (axis: "h" | "v", forward: boolean) => {
+    const sel = selectionRef.current;
+    const rect = normalizeSelection(sel);
+    const single = rect.rowMin === rect.rowMax && rect.colMin === rect.colMax;
+    // A single-cell selection has nothing to cycle through, so navigate the
+    // whole grid instead (and move the selection with the focus).
+    const domain = single ? fullGrid(columns.length, rows.length) : rect;
+    const focus = scanCell(domain, { row: sel.focusRow, col: sel.focusCol }, axis, forward);
+    const { row, col } = focus;
+    applySelection(single ? singleCellSelection(row, col) : { ...sel, focusRow: row, focusCol: col });
     ensureVisible(row, col);
   };
 
@@ -649,7 +695,14 @@ export function CanvasDataGrid<Row>({
     }
     if (mod && (event.key === "a" || event.key === "A")) {
       event.preventDefault();
-      applySelection({ anchorRow: 0, anchorCol: 0, focusRow: rows.length - 1, focusCol: columns.length - 1 });
+      applySelection({
+        anchorRow: 0,
+        anchorCol: 0,
+        extentRow: rows.length - 1,
+        extentCol: columns.length - 1,
+        focusRow: 0,
+        focusCol: 0,
+      });
       return;
     }
 
@@ -681,9 +734,11 @@ export function CanvasDataGrid<Row>({
         moveFocus(mod ? rows.length - 1 - sel.focusRow : 0, columns.length - 1 - sel.focusCol, event.shiftKey);
         break;
       case "Tab":
-        moveFocus(0, event.shiftKey ? -1 : 1, false);
+        scanMove("h", !event.shiftKey);
         break;
       case "Enter":
+        scanMove("v", !event.shiftKey);
+        break;
       case "F2":
         beginEdit({ row: sel.focusRow, col: sel.focusCol }, null, true);
         break;
@@ -704,10 +759,12 @@ export function CanvasDataGrid<Row>({
   const handleEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === "Enter") {
       event.preventDefault();
-      commitEdit({ dr: 1, dc: 0 });
+      commitEdit(true);
+      scanMove("v", !event.shiftKey);
     } else if (event.key === "Tab") {
       event.preventDefault();
-      commitEdit({ dr: 0, dc: event.shiftKey ? -1 : 1 });
+      commitEdit(true);
+      scanMove("h", !event.shiftKey);
     } else if (event.key === "Escape") {
       event.preventDefault();
       cancelEdit();
@@ -738,14 +795,22 @@ export function CanvasDataGrid<Row>({
     // Row gutter: select the whole row.
     if (x < gutterWidth && y >= headerHeight) {
       const row = clampRow(rowAxis.indexAt(scrollRef.current.y + (y - headerHeight)));
-      applySelection({ anchorRow: row, anchorCol: 0, focusRow: row, focusCol: Math.max(0, columns.length - 1) });
+      const lastCol = Math.max(0, columns.length - 1);
+      applySelection({ anchorRow: row, anchorCol: 0, extentRow: row, extentCol: lastCol, focusRow: row, focusCol: 0 });
       scheduleDraw();
       return;
     }
 
     // Corner: select everything.
     if (x < gutterWidth && y < headerHeight) {
-      applySelection({ anchorRow: 0, anchorCol: 0, focusRow: rows.length - 1, focusCol: columns.length - 1 });
+      applySelection({
+        anchorRow: 0,
+        anchorCol: 0,
+        extentRow: rows.length - 1,
+        extentCol: columns.length - 1,
+        focusRow: 0,
+        focusCol: 0,
+      });
       scheduleDraw();
       return;
     }
@@ -754,7 +819,8 @@ export function CanvasDataGrid<Row>({
     if (editingRef.current) commitEdit();
     const col = clampCol(colAxis.indexAt(scrollRef.current.x + (x - gutterWidth)));
     const row = clampRow(rowAxis.indexAt(scrollRef.current.y + (y - headerHeight)));
-    applySelection({ anchorRow: row, anchorCol: col, focusRow: row, focusCol: col });
+    dragAnchorRef.current = { row, col };
+    applySelection(singleCellSelection(row, col));
     dragRef.current = true;
     scheduleDraw();
   };
@@ -781,8 +847,16 @@ export function CanvasDataGrid<Row>({
       if (x < gutterWidth || y < headerHeight) return;
       const col = clampCol(colAxis.indexAt(scrollRef.current.x + (x - gutterWidth)));
       const row = clampRow(rowAxis.indexAt(scrollRef.current.y + (y - headerHeight)));
-      const sel = selectionRef.current;
-      applySelection({ anchorRow: sel.anchorRow, anchorCol: sel.anchorCol, focusRow: row, focusCol: col });
+      // anchor = where the drag began, extent = the cursor, focus = the anchor.
+      const anchor = dragAnchorRef.current;
+      applySelection({
+        anchorRow: anchor.row,
+        anchorCol: anchor.col,
+        extentRow: row,
+        extentCol: col,
+        focusRow: anchor.row,
+        focusCol: anchor.col,
+      });
       return;
     }
 
@@ -797,6 +871,20 @@ export function CanvasDataGrid<Row>({
       resizeColRef.current = -1;
       setResizeCol(-1);
       scheduleDraw();
+    }
+    if (dragRef.current) {
+      // The pointer gesture is over, so anchor and extent are interchangeable:
+      // normalise anchor to the top-left corner and extent to the bottom-right.
+      const sel = selectionRef.current;
+      const rect = normalizeSelection(sel);
+      applySelection({
+        anchorRow: rect.rowMin,
+        anchorCol: rect.colMin,
+        extentRow: rect.rowMax,
+        extentCol: rect.colMax,
+        focusRow: sel.focusRow,
+        focusCol: sel.focusCol,
+      });
     }
     dragRef.current = false;
     if (pendingSortRef.current >= 0) {
@@ -879,7 +967,7 @@ export function CanvasDataGrid<Row>({
           value={editText}
           onChange={(event) => setEditText(event.target.value)}
           onKeyDown={handleEditorKeyDown}
-          onBlur={() => commitEdit(undefined, false)}
+          onBlur={() => commitEdit(false)}
           spellCheck={false}
           className="absolute z-20 box-border select-text rounded-[3px] border-2 border-ring bg-background text-[13px] leading-none text-foreground shadow-sm outline-none"
           style={editorStyle}

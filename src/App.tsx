@@ -4,6 +4,7 @@ import { Moon, Search, Sun } from "lucide-react";
 import {
   CanvasDataGrid,
   createOrders,
+  normalizeSelection,
   orderColumns,
   searchableFields,
   type GridStats,
@@ -31,14 +32,15 @@ interface SelectionSummary {
 }
 
 function summarize(selection: SelectionRange, headers: readonly string[]): SelectionSummary {
-  const rowMin = Math.min(selection.anchorRow, selection.focusRow);
-  const rowMax = Math.max(selection.anchorRow, selection.focusRow);
-  const colMin = Math.min(selection.anchorCol, selection.focusCol);
-  const colMax = Math.max(selection.anchorCol, selection.focusCol);
-  const rows = rowMax - rowMin + 1;
-  const cols = colMax - colMin + 1;
-  const header = headers[colMin] ?? "—";
-  const label = cols === 1 && rows === 1 ? `${header} · row ${rowMin + 1}` : `${header} · rows ${rowMin + 1}–${rowMax + 1}`;
+  const rect = normalizeSelection(selection);
+  const rows = rect.rowMax - rect.rowMin + 1;
+  const cols = rect.colMax - rect.colMin + 1;
+  const active = headers[selection.focusCol] ?? "—";
+  const range = `${headers[rect.colMin] ?? "—"}…${headers[rect.colMax] ?? "—"}`;
+  const label =
+    cols === 1 && rows === 1
+      ? `${active} · row ${selection.focusRow + 1}`
+      : `${range} · rows ${rect.rowMin + 1}–${rect.rowMax + 1} · active ${active} ${selection.focusRow + 1}`;
   return { label, cells: rows * cols };
 }
 
@@ -122,10 +124,10 @@ export function App() {
             {summary.cells > 1 ? ` · ${summary.cells.toLocaleString()} cells` : ""}
           </span>
         ) : (
-          <span>Arrow keys to move · type to edit</span>
+          <span>Arrows to move · Enter/Tab to step · type to edit</span>
         )}
         <span className="ml-auto hidden sm:inline">
-          Double-click to edit · drag headers to resize · click headers to sort · drag the scrollbars · ⌘/Ctrl+C / ⌘/Ctrl+V
+          Double-click or F2 to edit · Shift+Arrows to select · drag headers to resize · click headers to sort · ⌘/Ctrl+C / ⌘/Ctrl+V
         </span>
       </footer>
     </div>

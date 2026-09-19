@@ -41,7 +41,13 @@ Features:
   React renders per scroll frame
 - frozen column header + row-number gutter
 - cell / range selection, marquee drag, row select, select-all
-- keyboard navigation (arrows, `Shift+Arrows`, `PageUp/Down`, `Home`/`End`, `Tab`)
+- three-point selection model (`anchor` / `extent` / `focus`): the rectangle is
+  the bounding box of anchor + extent, and the active cell may sit anywhere
+  inside it; after a pointer gesture anchor/extent are normalised to the
+  top-left/bottom-right corners
+- keyboard navigation — arrows (+`Shift` to extend), `PageUp/Down`,
+  `Home`/`End`; `Enter`/`Tab` cycle the active cell inside the selection and
+  wrap (`Enter` column-major, `Tab` row-major)
 - inline editing (double-click, `F2`, or just start typing) with type coercion
 - click-to-sort headers, drag-to-resize columns
 - `⌘/Ctrl+C` / `⌘/Ctrl+V` of TSV ranges

@@ -162,6 +162,17 @@ export function drawGrid(input: RenderInput): void {
   ctx.fillRect(sx0, sy0, sx1 - sx0, sy1 - sy0);
   ctx.globalAlpha = 1;
 
+  // The active cell is drawn "cut out" of the tint (like Excel/Sheets), so it
+  // stays obvious wherever the focus sits inside the range.
+  const focusCol = input.selection.focusCol;
+  const focusRow = input.selection.focusRow;
+  if (input.editing === null) {
+    const fx = bodyX + input.colAxis.offsetOf(focusCol) - input.scrollX;
+    const fy = bodyY + input.rowAxis.offsetOf(focusRow) - input.scrollY;
+    ctx.fillStyle = theme.background;
+    ctx.fillRect(fx, fy, input.colAxis.sizeOf(focusCol), input.rowAxis.sizeOf(focusRow));
+  }
+
   // --- Grid lines ---
   ctx.strokeStyle = theme.border;
   ctx.lineWidth = 1;
@@ -249,9 +260,21 @@ export function drawGrid(input: RenderInput): void {
     ctx.strokeStyle = theme.primary;
     ctx.lineWidth = 2;
     ctx.strokeRect(clampX0 + 1, clampY0 + 1, clampX1 - clampX0 - 2, clampY1 - clampY0 - 2);
+    const multiCell = rect.rowMin !== rect.rowMax || rect.colMin !== rect.colMax;
     if (input.editing === null) {
+      // Fill handle anchored at the range's bottom-right corner.
       ctx.fillStyle = theme.primary;
       ctx.fillRect(clampX1 - 4, clampY1 - 4, 6, 6);
+    }
+    // Inner marker for the active cell when it is not the whole selection.
+    if (input.editing === null && multiCell) {
+      const fx = bodyX + input.colAxis.offsetOf(focusCol) - input.scrollX;
+      const fy = bodyY + input.rowAxis.offsetOf(focusRow) - input.scrollY;
+      const fw = input.colAxis.sizeOf(focusCol);
+      const fh = input.rowAxis.sizeOf(focusRow);
+      ctx.strokeStyle = theme.ring;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(fx + 1, fy + 1, fw - 2, fh - 2);
     }
   }
 

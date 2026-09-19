@@ -2,8 +2,9 @@ import { describe, expect, test } from "bun:test";
 
 import { compareValues, formatCell, parseEditedValue, resolveValue } from "../format";
 import { Axis } from "../layout";
+import { fullGrid, scanCell } from "../navigation";
 import { computeThumb, dragScroll, thumbToScroll } from "../scrollbar";
-import { normalizeSelection } from "../types";
+import { clampToRect, normalizeSelection, singleCellSelection } from "../types";
 import type { ColumnDef } from "../types";
 
 describe("Axis.uniform", () => {
@@ -65,13 +66,92 @@ describe("Axis.variable", () => {
 });
 
 describe("normalizeSelection", () => {
-  test("orders anchor/focus into a rect", () => {
-    expect(normalizeSelection({ anchorRow: 5, anchorCol: 3, focusRow: 2, focusCol: 7 })).toEqual({
+  test("bounds anchor/extent into a rect", () => {
+    expect(
+      normalizeSelection({ anchorRow: 5, anchorCol: 3, extentRow: 2, extentCol: 7, focusRow: 4, focusCol: 4 }),
+    ).toEqual({
       rowMin: 2,
       rowMax: 5,
       colMin: 3,
       colMax: 7,
     });
+  });
+
+  test("focus does not influence the rectangle", () => {
+    const rect = normalizeSelection({
+      anchorRow: 0,
+      anchorCol: 0,
+      extentRow: 3,
+      extentCol: 3,
+      focusRow: 1,
+      focusCol: 2,
+    });
+    expect(rect).toEqual({ rowMin: 0, rowMax: 3, colMin: 0, colMax: 3 });
+  });
+});
+
+describe("clampToRect", () => {
+  const rect = { rowMin: 2, rowMax: 5, colMin: 3, colMax: 7 };
+
+  test("keeps a cell inside the rect", () => {
+    expect(clampToRect(rect, 4, 4)).toEqual({ row: 4, col: 4 });
+  });
+
+  test("pulls an outside cell to the nearest edge", () => {
+    expect(clampToRect(rect, 0, 0)).toEqual({ row: 2, col: 3 });
+    expect(clampToRect(rect, 9, 9)).toEqual({ row: 5, col: 7 });
+  });
+});
+
+describe("singleCellSelection", () => {
+  test("collapses anchor, extent and focus", () => {
+    expect(singleCellSelection(4, 2)).toEqual({
+      anchorRow: 4,
+      anchorCol: 2,
+      extentRow: 4,
+      extentCol: 2,
+      focusRow: 4,
+      focusCol: 2,
+    });
+  });
+});
+
+describe("scanCell within a range", () => {
+  const rect = { rowMin: 0, rowMax: 2, colMin: 0, colMax: 2 };
+
+  test("Tab scans row-major and wraps to the next row", () => {
+    expect(scanCell(rect, { row: 0, col: 2 }, "h", true)).toEqual({ row: 1, col: 0 });
+    expect(scanCell(rect, { row: 2, col: 2 }, "h", true)).toEqual({ row: 0, col: 0 });
+  });
+
+  test("Shift+Tab scans backwards and wraps to the previous row", () => {
+    expect(scanCell(rect, { row: 1, col: 0 }, "h", false)).toEqual({ row: 0, col: 2 });
+    expect(scanCell(rect, { row: 0, col: 0 }, "h", false)).toEqual({ row: 2, col: 2 });
+  });
+
+  test("Enter scans column-major and wraps to the next column", () => {
+    expect(scanCell(rect, { row: 2, col: 0 }, "v", true)).toEqual({ row: 0, col: 1 });
+    expect(scanCell(rect, { row: 2, col: 2 }, "v", true)).toEqual({ row: 0, col: 0 });
+  });
+
+  test("Shift+Enter scans backwards and wraps to the previous column", () => {
+    expect(scanCell(rect, { row: 0, col: 1 }, "v", false)).toEqual({ row: 2, col: 0 });
+    expect(scanCell(rect, { row: 0, col: 0 }, "v", false)).toEqual({ row: 2, col: 2 });
+  });
+});
+
+describe("scanCell across the whole grid (single cell)", () => {
+  const grid = fullGrid(4, 3); // 4 columns, 3 rows
+
+  test("Tab is row-major and wraps rows", () => {
+    expect(scanCell(grid, { row: 0, col: 0 }, "h", true)).toEqual({ row: 0, col: 1 });
+    expect(scanCell(grid, { row: 0, col: 3 }, "h", true)).toEqual({ row: 1, col: 0 });
+    expect(scanCell(grid, { row: 2, col: 3 }, "h", true)).toEqual({ row: 0, col: 0 });
+  });
+
+  test("Enter is column-major and wraps columns", () => {
+    expect(scanCell(grid, { row: 2, col: 0 }, "v", true)).toEqual({ row: 0, col: 1 });
+    expect(scanCell(grid, { row: 0, col: 1 }, "v", false)).toEqual({ row: 2, col: 0 });
   });
 });
 
