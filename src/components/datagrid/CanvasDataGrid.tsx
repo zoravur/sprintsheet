@@ -598,6 +598,13 @@ export function CanvasDataGrid<Row>({
    * keep it. While editing, the field owns text entry, the arrow keys and
    * Delete/Backspace — everything else maps to a command, and the model commits
    * the edit before applying it.
+   *
+   * There is deliberately exactly ONE keydown handler in this component (the
+   * wrapper's `handleKeyDown`). An earlier version also handled keys on the
+   * editor field; because committing clears `editing` synchronously, the same
+   * event then bubbled here with the guard no longer tripping, so the
+   * navigation ran a second time — pressing Tab while editing skipped a cell.
+   * Adding a second handler brings that back.
    */
   const commandForKeyDown = (event: React.KeyboardEvent): Command<Row> | null => {
     const editing = model.getState().editing !== null;
@@ -731,6 +738,7 @@ export function CanvasDataGrid<Row>({
       />
 
       {editor && editorStyle ? (
+        /* No onKeyDown here on purpose: keys are handled once, on the wrapper. */
         <input
           ref={editorRef}
           value={editor.text}
