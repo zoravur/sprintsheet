@@ -128,7 +128,55 @@ export function initialState<Row>(rows: Row[], columns: ColumnDef<Row>[]): Sprea
   };
 }
 
+/**
+ * Commands that implicitly finish an open edit before they apply — i.e. "most
+ * navigation actions just end edit mode". The view deliberately keeps the arrow
+ * keys out of this path while editing (they become caret movement inside the
+ * field), so they are listed only as a defensive default.
+ */
+const ENDS_EDIT = new Set<Command<any>["type"]>([
+  "selectCell",
+  "selectRange",
+  "selectRow",
+  "selectAll",
+  "move",
+  "moveTo",
+  "scan",
+  "sortColumn",
+  "setColumnWidth",
+  "clearCells",
+  "paste",
+]);
+
+/** Write the edited value back (if changed) and leave edit mode. */
+function commitEditing<Row>(state: SpreadsheetState<Row>): CommandResult<Row> {
+  const editing = state.editing;
+  if (!editing) return { state, effects: NO_EFFECTS as Effect<Row>[] };
+
+  const effects: Effect<Row>[] = [];
+  const column = state.columns[editing.col];
+  const target = state.view[editing.row];
+  if (column && target !== undefined && column.field !== undefined) {
+    const previous = resolveValue(column, target, editing.row);
+    const value = parseEditedValue(column, editing.text);
+    if (value !== previous) {
+      (target as Record<string, unknown>)[column.field] = value;
+      effects.push({ type: "edited", row: target, rowIndex: editing.row, column, value, previous });
+    }
+  }
+  effects.push({ type: "focusGrid" });
+  return { state: { ...state, editing: null }, effects };
+}
+
 export function reduce<Row>(state: SpreadsheetState<Row>, command: Command<Row>): CommandResult<Row> {
+  // Edit mode is a mode of the sheet, not a special case for the view: any
+  // navigation command commits the pending edit first, then proceeds.
+  if (state.editing && ENDS_EDIT.has(command.type)) {
+    const committed = commitEditing(state);
+    const result = reduce(committed.state, command);
+    return { state: result.state, effects: [...committed.effects, ...result.effects] };
+  }
+
   const rowCount = state.rows.length;
   const colCount = state.columns.length;
   const empty: CommandResult<Row> = { state, effects: NO_EFFECTS as Effect<Row>[] };
@@ -266,23 +314,8 @@ export function reduce<Row>(state: SpreadsheetState<Row>, command: Command<Row>)
       return { state: { ...state, editing: null }, effects: [{ type: "focusGrid" }] };
     }
 
-    case "commitEdit": {
-      const editing = state.editing;
-      if (!editing) return empty;
-      const effects: Effect<Row>[] = [];
-      const column = state.columns[editing.col];
-      const target = state.view[editing.row];
-      if (column && target !== undefined && column.field !== undefined) {
-        const previous = resolveValue(column, target, editing.row);
-        const value = parseEditedValue(column, editing.text);
-        if (value !== previous) {
-          (target as Record<string, unknown>)[column.field] = value;
-          effects.push({ type: "edited", row: target, rowIndex: editing.row, column, value, previous });
-        }
-      }
-      effects.push({ type: "focusGrid" });
-      return { state: { ...state, editing: null }, effects };
-    }
+    case "commitEdit":
+      return commitEditing(state);
 
     case "sortColumn": {
       const column = state.columns.find((c) => c.id === command.columnId);

@@ -342,6 +342,75 @@ describe("editing", () => {
   });
 });
 
+describe("edit mode ends on navigation", () => {
+  test("an open edit is committed before a scan (Enter/Tab)", () => {
+    const m = makeModel();
+    m.dispatch({ type: "selectCell", row: 0, col: 1 });
+    m.dispatch({ type: "beginEdit", seed: "typed", selectAll: false });
+
+    const effects = m.dispatch({ type: "scan", axis: "v", forward: true });
+
+    expect(m.getState().editing).toBe(null);
+    expect(m.getState().view[0]?.name).toBe("typed");
+    expect(sel(m).focusRow).toBe(1);
+    // commit effects come first, then the navigation's reveal
+    expect(effects.map((e) => e.type)).toEqual(["edited", "focusGrid", "reveal"]);
+  });
+
+  test("selectCell (a click) commits the open edit", () => {
+    const m = makeModel();
+    m.dispatch({ type: "selectCell", row: 0, col: 2 });
+    m.dispatch({ type: "beginEdit", seed: "9", selectAll: false });
+    m.dispatch({ type: "selectCell", row: 2, col: 0 });
+    expect(m.getState().view[0]?.amount).toBe(9);
+    expect(m.getState().editing).toBe(null);
+    expect(sel(m).focusRow).toBe(2);
+  });
+
+  test("a `move` command also ends edit mode", () => {
+    const m = makeModel();
+    m.dispatch({ type: "selectCell", row: 0, col: 1 });
+    m.dispatch({ type: "beginEdit", seed: "q", selectAll: false });
+    m.dispatch({ type: "move", dr: 1, dc: 0, extend: false });
+    expect(m.getState().editing).toBe(null);
+    expect(m.getState().view[0]?.name).toBe("q");
+  });
+
+  test("sortColumn commits the open edit", () => {
+    const m = makeModel();
+    m.dispatch({ type: "selectCell", row: 0, col: 1 });
+    m.dispatch({ type: "beginEdit", seed: "zzz", selectAll: false });
+    m.dispatch({ type: "sortColumn", columnId: "amount" });
+    expect(m.getState().editing).toBe(null);
+    expect(m.getState().view[0]?.name).toBe("zzz");
+  });
+
+  test("navigation with no open edit emits no commit effects", () => {
+    const m = makeModel();
+    const effects = m.dispatch({ type: "scan", axis: "v", forward: true });
+    expect(effects.map((e) => e.type)).toEqual(["reveal"]);
+  });
+
+  test("editing commands themselves do not commit", () => {
+    const m = makeModel();
+    m.dispatch({ type: "selectCell", row: 0, col: 1 });
+    m.dispatch({ type: "beginEdit", seed: "a", selectAll: false });
+    m.dispatch({ type: "setEditText", text: "ab" });
+    expect(m.getState().editing?.text).toBe("ab");
+    expect(m.getState().view[0]?.name).toBe("name-0"); // not committed
+  });
+
+  test("replacing the data cancels without writing the pending text", () => {
+    const m = makeModel(5);
+    const original = m.getState().view[0]!;
+    m.dispatch({ type: "selectCell", row: 0, col: 1 });
+    m.dispatch({ type: "beginEdit", seed: "ignored", selectAll: false });
+    m.dispatch({ type: "setRows", rows: makeRows(5) });
+    expect(original.name).toBe("name-0");
+    expect(m.getState().editing).toBe(null);
+  });
+});
+
 describe("sorting", () => {
   test("cycles asc -> desc -> off and reorders the view", () => {
     const m = makeModel();

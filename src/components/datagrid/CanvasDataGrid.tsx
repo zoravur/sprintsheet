@@ -487,8 +487,8 @@ export function CanvasDataGrid<Row>({
       return;
     }
 
-    // Body: collapse to the pressed cell and begin a marquee.
-    if (model.getState().editing) run({ type: "commitEdit" }, { refocus: false });
+    // Body: collapse to the pressed cell and begin a marquee. Any open edit is
+    // committed by the model as part of `selectCell`.
     const cell = cellAt(x, y);
     dragAnchorRef.current = cell;
     dragRef.current = true;
@@ -593,22 +593,71 @@ export function CanvasDataGrid<Row>({
     return lines.join("\n");
   };
 
-  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (model.getState().editing) return;
-    if (state.view.length === 0 || state.columns.length === 0) return;
-
-    const sel = model.getState().selection;
+  /**
+   * Translate a key event into a command, or `null` to let the browser/field
+   * keep it. While editing, the field owns text entry, the arrow keys and
+   * Delete/Backspace — everything else maps to a command, and the model commits
+   * the edit before applying it.
+   */
+  const commandForKeyDown = (event: React.KeyboardEvent): Command<Row> | null => {
+    const editing = model.getState().editing !== null;
     const mod = event.ctrlKey || event.metaKey;
+    const extend = event.shiftKey;
+    const sel = model.getState().selection;
     const pageRows = Math.max(1, Math.floor((sizeRef.current.h - headerHeight) / rowHeight) - 1);
     const lastRow = state.view.length - 1;
     const lastCol = state.columns.length - 1;
 
+    switch (event.key) {
+      case "ArrowUp":
+        return editing ? null : { type: "move", dr: -1, dc: 0, extend };
+      case "ArrowDown":
+        return editing ? null : { type: "move", dr: 1, dc: 0, extend };
+      case "ArrowLeft":
+        return editing ? null : { type: "move", dr: 0, dc: -1, extend };
+      case "ArrowRight":
+        return editing ? null : { type: "move", dr: 0, dc: 1, extend };
+      case "PageUp":
+        return { type: "move", dr: -pageRows, dc: 0, extend };
+      case "PageDown":
+        return { type: "move", dr: pageRows, dc: 0, extend };
+      case "Home":
+        return { type: "moveTo", row: mod ? 0 : sel.focusRow, col: 0, extend };
+      case "End":
+        return { type: "moveTo", row: mod ? lastRow : sel.focusRow, col: lastCol, extend };
+      case "Tab":
+        return { type: "scan", axis: "h", forward: !extend };
+      case "Enter":
+        return { type: "scan", axis: "v", forward: !extend };
+      case "Escape":
+        return editing ? { type: "cancelEdit" } : null;
+      case "F2":
+        return editing ? null : { type: "beginEdit", seed: null, selectAll: true };
+      case "Delete":
+      case "Backspace":
+        return editing ? null : { type: "clearCells" };
+      default:
+        if (event.key.length === 1 && !mod && !event.altKey) {
+          return editing ? null : { type: "beginEdit", seed: event.key, selectAll: false };
+        }
+        return null;
+    }
+  };
+
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (state.view.length === 0 || state.columns.length === 0) return;
+    const editing = model.getState().editing !== null;
+    const mod = event.ctrlKey || event.metaKey;
+
+    // Clipboard / select-all: while editing the field handles these natively.
     if (mod && (event.key === "c" || event.key === "C")) {
+      if (editing) return;
       event.preventDefault();
       void navigator.clipboard?.writeText(selectionToTsv());
       return;
     }
     if (mod && (event.key === "v" || event.key === "V")) {
+      if (editing) return;
       event.preventDefault();
       void (async () => {
         try {
@@ -621,81 +670,16 @@ export function CanvasDataGrid<Row>({
       return;
     }
     if (mod && (event.key === "a" || event.key === "A")) {
+      if (editing) return;
       event.preventDefault();
       run({ type: "selectAll" });
       return;
     }
 
-    let handled = true;
-    switch (event.key) {
-      case "ArrowUp":
-        run({ type: "move", dr: -1, dc: 0, extend: event.shiftKey });
-        break;
-      case "ArrowDown":
-        run({ type: "move", dr: 1, dc: 0, extend: event.shiftKey });
-        break;
-      case "ArrowLeft":
-        run({ type: "move", dr: 0, dc: -1, extend: event.shiftKey });
-        break;
-      case "ArrowRight":
-        run({ type: "move", dr: 0, dc: 1, extend: event.shiftKey });
-        break;
-      case "PageUp":
-        run({ type: "move", dr: -pageRows, dc: 0, extend: event.shiftKey });
-        break;
-      case "PageDown":
-        run({ type: "move", dr: pageRows, dc: 0, extend: event.shiftKey });
-        break;
-      case "Home":
-        run(
-          mod
-            ? { type: "moveTo", row: 0, col: 0, extend: event.shiftKey }
-            : { type: "moveTo", row: sel.focusRow, col: 0, extend: event.shiftKey },
-        );
-        break;
-      case "End":
-        run(
-          mod
-            ? { type: "moveTo", row: lastRow, col: lastCol, extend: event.shiftKey }
-            : { type: "moveTo", row: sel.focusRow, col: lastCol, extend: event.shiftKey },
-        );
-        break;
-      case "Tab":
-        run({ type: "scan", axis: "h", forward: !event.shiftKey });
-        break;
-      case "Enter":
-        run({ type: "scan", axis: "v", forward: !event.shiftKey });
-        break;
-      case "F2":
-        run({ type: "beginEdit", seed: null, selectAll: true });
-        break;
-      case "Delete":
-      case "Backspace":
-        run({ type: "clearCells" });
-        break;
-      default:
-        if (event.key.length === 1 && !mod && !event.altKey) {
-          run({ type: "beginEdit", seed: event.key, selectAll: false });
-        } else {
-          handled = false;
-        }
-    }
-    if (handled) event.preventDefault();
-  };
-
-  const handleEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      run({ type: "commitEdit" });
-      run({ type: "scan", axis: "v", forward: !event.shiftKey });
-    } else if (event.key === "Tab") {
-      event.preventDefault();
-      run({ type: "commitEdit" });
-      run({ type: "scan", axis: "h", forward: !event.shiftKey });
-    } else if (event.key === "Escape") {
-      event.preventDefault();
-      run({ type: "cancelEdit" });
-    }
+    const command = commandForKeyDown(event);
+    if (!command) return; // the field / browser keeps this key
+    event.preventDefault();
+    run(command);
   };
 
   // ---- editor overlay position -------------------------------------------
@@ -751,7 +735,6 @@ export function CanvasDataGrid<Row>({
           ref={editorRef}
           value={editor.text}
           onChange={(event) => run({ type: "setEditText", text: event.target.value })}
-          onKeyDown={handleEditorKeyDown}
           onBlur={() => run({ type: "commitEdit" }, { refocus: false })}
           spellCheck={false}
           className="absolute z-20 box-border select-text rounded-[3px] border-2 border-ring bg-background text-[13px] leading-none text-foreground shadow-sm outline-none"

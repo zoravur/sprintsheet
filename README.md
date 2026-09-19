@@ -48,7 +48,10 @@ Features:
 - keyboard navigation — arrows (+`Shift` to extend), `PageUp/Down`,
   `Home`/`End`; `Enter`/`Tab` cycle the active cell inside the selection and
   wrap (`Enter` column-major, `Tab` row-major)
-- inline editing (double-click, `F2`, or just start typing) with type coercion
+- inline editing (double-click, `F2`, or just start typing) with type coercion.
+  Edit mode is a *model* mode, not a view special case: while editing the arrow
+  keys become caret movement, and every other navigation command commits the
+  pending edit before it runs (see `ENDS_EDIT` in `spreadsheet.ts`)
 - click-to-sort headers, drag-to-resize columns
 - `⌘/Ctrl+C` / `⌘/Ctrl+V` of TSV ranges
 - reads shadcn/Tailwind theme tokens and follows dark mode
