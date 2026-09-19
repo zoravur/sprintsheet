@@ -1,39 +1,37 @@
 /**
- * <CanvasDataGrid /> — a virtualized spreadsheet datatable painted on a single
- * 2D canvas.
+ * <CanvasDataGrid /> — a canvas view over the headless {@link SpreadsheetModel}.
  *
- * Design notes:
- *  - React owns *semantic* state (selection, sort, column widths, the open
- *    editor). It never re-renders per scroll frame.
- *  - The canvas repaints imperatively inside a single rAF, reading a snapshot
- *    that is refreshed after every React render. So a scroll or a drag only
- *    costs one canvas paint, not a reconciliation.
- *  - Native scrollbars are reused: a spacer element gives the scroller its
- *    range, and the canvas is a sibling overlay sized to the content viewport
- *    (excluding scrollbars). Wheel events are forwarded to the scroller.
+ * The component owns *no* document state. It:
+ *  1. creates a `SpreadsheetModel` and subscribes with `useSyncExternalStore`;
+ *  2. turns DOM events into {@link Command}s and dispatches them;
+ *  3. turns the returned {@link Effect}s (reveal / focusGrid / edited) into view
+ *     side effects (scrolling, DOM focus, callbacks);
+ *  4. paints the model state to a single 2D canvas inside one rAF.
+ *
+ * Scroll offsets, hover and column-resize-in-progress stay here because they are
+ * presentation, not document state.
  */
 
 import * as React from "react";
 
 import { cn } from "@/lib/utils";
 
-import { compareValues, defaultAlign, parseEditedValue, resolveValue } from "./format";
 import { Axis } from "./layout";
-import { fullGrid, scanCell } from "./navigation";
 import { drawGrid, RESIZE_HANDLE_PX } from "./renderer";
 import { computeThumb, dragScroll, thumbToScroll } from "./scrollbar";
+import { SpreadsheetModel, type Command, type Effect } from "./spreadsheet";
 import { getGridTheme, refreshGridTheme, type GridMetrics, type GridTheme } from "./theme";
-import {
-  clampToRect,
-  EMPTY_SELECTION,
-  normalizeSelection,
-  singleCellSelection,
-  type CellAddress,
-  type CellValue,
-  type ColumnDef,
-  type SelectionRange,
-  type SortState,
-} from "./types";
+import { normalizeSelection, type CellAddress, type ColumnDef, type SelectionRange, type SortState } from "./types";
+
+export interface GridStats {
+  /** How long the last canvas paint took, in ms. */
+  frameMs: number;
+  /** Inclusive bounds of the rows currently drawn. */
+  firstRow: number;
+  lastRow: number;
+  firstCol: number;
+  lastCol: number;
+}
 
 export interface CanvasDataGridProps<Row> {
   rows: readonly Row[];
@@ -47,22 +45,12 @@ export interface CanvasDataGridProps<Row> {
     row: Row;
     rowIndex: number;
     column: ColumnDef<Row>;
-    value: CellValue;
-    previous: CellValue;
+    value: unknown;
+    previous: unknown;
   }) => void;
   onSelectionChange?: (selection: SelectionRange) => void;
   /** Throttled (~5/s) report of frame cost + which rows/cols are on screen. */
   onStats?: (stats: GridStats) => void;
-}
-
-export interface GridStats {
-  /** How long the last canvas paint took, in ms. */
-  frameMs: number;
-  /** Inclusive bounds of the rows currently drawn. */
-  firstRow: number;
-  lastRow: number;
-  firstCol: number;
-  lastCol: number;
 }
 
 interface Snapshot {
@@ -90,12 +78,6 @@ const SCROLLBAR = 12;
 /** Smallest thumb length so a huge dataset still yields a grabbable handle. */
 const MIN_THUMB = 28;
 
-function editTextFor(col: ColumnDef<any>, value: CellValue): string {
-  if (value === null || value === undefined) return "";
-  if (value instanceof Date) return value.toISOString().slice(0, 10);
-  return String(value);
-}
-
 export function CanvasDataGrid<Row>({
   rows,
   columns,
@@ -107,31 +89,27 @@ export function CanvasDataGrid<Row>({
   onSelectionChange,
   onStats,
 }: CanvasDataGridProps<Row>) {
-  // ---- derived layout -----------------------------------------------------
-  const [widths, setWidths] = React.useState<number[]>(() => columns.map((c) => c.width));
-  const colAxis = React.useMemo(() => Axis.variable(widths), [widths]);
-  const rowAxis = React.useMemo(() => Axis.uniform(rows.length, rowHeight), [rows.length, rowHeight]);
-  const metrics = React.useMemo<GridMetrics>(
-    () => ({ rowHeight, headerHeight, gutterWidth }),
-    [rowHeight, headerHeight, gutterWidth],
-  );
+  // ---- model --------------------------------------------------------------
+  const modelRef = React.useRef<SpreadsheetModel<Row> | null>(null);
+  if (modelRef.current === null) {
+    modelRef.current = new SpreadsheetModel<Row>(rows as Row[], columns as ColumnDef<Row>[]);
+  }
+  const model = modelRef.current;
+  const state = React.useSyncExternalStore(model.subscribe, model.getState);
 
-  const columnSignature = columns.map((c) => `${c.id}:${c.width}`).join("|");
+  // Push prop changes into the model (guarded so mount doesn't churn).
   React.useEffect(() => {
-    setWidths((prev) => (prev.length === columns.length ? prev : columns.map((c) => c.width)));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [columnSignature]);
+    if (model.getState().rows !== rows) model.dispatch({ type: "setRows", rows: rows as Row[] });
+  }, [model, rows]);
+  React.useEffect(() => {
+    if (model.getState().columns !== columns) model.dispatch({ type: "setColumns", columns: columns as ColumnDef<Row>[] });
+  }, [model, columns]);
 
-  // ---- selection / sort state --------------------------------------------
-  const [sort, setSort] = React.useState<SortState | null>(null);
-  const [selection, setSelectionState] = React.useState<SelectionRange>(EMPTY_SELECTION);
+  // ---- presentational state ----------------------------------------------
   const [hover, setHover] = React.useState<CellAddress>(NO_HOVER);
   const [resizeCol, setResizeCol] = React.useState(-1);
-  const [editing, setEditing] = React.useState<CellAddress | null>(null);
-  const [editText, setEditText] = React.useState("");
   const [scrollState, setScrollState] = React.useState({ x: 0, y: 0 });
 
-  // ---- refs ---------------------------------------------------------------
   const wrapperRef = React.useRef<HTMLDivElement>(null);
   const scrollerRef = React.useRef<HTMLDivElement>(null);
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
@@ -141,91 +119,37 @@ export function CanvasDataGrid<Row>({
   const sizeRef = React.useRef({ w: 0, h: 0, dpr: 1 });
   const scrollRef = React.useRef({ x: 0, y: 0 });
   const themeRef = React.useRef<GridTheme>(getGridTheme());
-  const metricsRef = React.useRef(metrics);
-  const selectionRef = React.useRef<SelectionRange>(EMPTY_SELECTION);
-  const editingRef = React.useRef<CellAddress | null>(null);
+  const metricsRef = React.useRef<GridMetrics>({ rowHeight, headerHeight, gutterWidth });
+  const hoverRef = React.useRef<CellAddress>(NO_HOVER);
   const resizeColRef = React.useRef(-1);
   const dragRef = React.useRef(false);
   const dragAnchorRef = React.useRef<CellAddress>({ row: 0, col: 0 });
   const resizeSessionRef = React.useRef<ResizeSession | null>(null);
   const pendingSortRef = React.useRef(-1);
-  const selectAllOnFocusRef = React.useRef(true);
   const lastStatsRef = React.useRef(0);
   const onStatsRef = React.useRef(onStats);
   const onCellEditRef = React.useRef(onCellEdit);
   const onSelectionChangeRef = React.useRef(onSelectionChange);
   const snapshotRef = React.useRef<Snapshot>({
-    columns: columns as readonly ColumnDef<any>[],
-    rows: rows as readonly any[],
-    colAxis,
-    rowAxis,
-    selection,
-    sort,
-    hover,
-    resizeCol,
-    editing,
+    columns: state.columns as readonly ColumnDef<any>[],
+    rows: state.view as readonly any[],
+    colAxis: Axis.variable(state.widths),
+    rowAxis: Axis.uniform(state.view.length, rowHeight),
+    selection: state.selection,
+    sort: state.sort,
+    hover: NO_HOVER,
+    resizeCol: -1,
+    editing: null,
   });
 
   onStatsRef.current = onStats;
   onCellEditRef.current = onCellEdit;
   onSelectionChangeRef.current = onSelectionChange;
+  metricsRef.current = { rowHeight, headerHeight, gutterWidth };
 
-  // ---- sorted view (copies pointers only, never the rows themselves) ------
-  const sortedView = React.useMemo<readonly Row[]>(() => {
-    if (!sort) return rows;
-    const index = columns.findIndex((c) => c.id === sort.columnId);
-    const col = columns[index];
-    if (!col) return rows;
-    const decorated = rows.map((row, i) => ({ row, i }));
-    decorated.sort((a, b) => {
-      const cmp = compareValues(resolveValue(col, a.row, a.i), resolveValue(col, b.row, b.i));
-      return sort.direction === "asc" ? cmp : -cmp;
-    });
-    return decorated.map((d) => d.row);
-  }, [rows, columns, sort]);
-
-  // keep refs in sync with the latest committed state
-  React.useEffect(() => {
-    selectionRef.current = selection;
-  }, [selection]);
-  React.useEffect(() => {
-    editingRef.current = editing;
-  }, [editing]);
-  metricsRef.current = metrics;
-
-  // Clamp the selection when the dataset shape changes (e.g. filtering).
-  React.useEffect(() => {
-    setSelectionState((prev) => {
-      const maxRow = Math.max(0, rows.length - 1);
-      const maxCol = Math.max(0, columns.length - 1);
-      const anchorRow = Math.min(prev.anchorRow, maxRow);
-      const anchorCol = Math.min(prev.anchorCol, maxCol);
-      const extentRow = Math.min(prev.extentRow, maxRow);
-      const extentCol = Math.min(prev.extentCol, maxCol);
-      const rect = normalizeSelection({ ...prev, anchorRow, anchorCol, extentRow, extentCol });
-      const focus = clampToRect(rect, prev.focusRow, prev.focusCol);
-      const next: SelectionRange = {
-        anchorRow,
-        anchorCol,
-        extentRow,
-        extentCol,
-        focusRow: focus.row,
-        focusCol: focus.col,
-      };
-      if (
-        next.anchorRow === prev.anchorRow &&
-        next.anchorCol === prev.anchorCol &&
-        next.extentRow === prev.extentRow &&
-        next.extentCol === prev.extentCol &&
-        next.focusRow === prev.focusRow &&
-        next.focusCol === prev.focusCol
-      ) {
-        return prev;
-      }
-      selectionRef.current = next;
-      return next;
-    });
-  }, [rows.length, columns.length]);
+  // ---- derived layout -----------------------------------------------------
+  const colAxis = React.useMemo(() => Axis.variable(state.widths), [state.widths]);
+  const rowAxis = React.useMemo(() => Axis.uniform(state.view.length, rowHeight), [state.view.length, rowHeight]);
 
   // ---- imperative draw ----------------------------------------------------
   const drawRef = React.useRef<() => void>(() => {});
@@ -257,8 +181,8 @@ export function CanvasDataGrid<Row>({
       editing: snap.editing,
     });
     const frameMs = performance.now() - t0;
-    const bodyH = Math.max(0, sizeRef.current.h - headerHeight);
-    const bodyW = Math.max(0, sizeRef.current.w - gutterWidth);
+    const bodyH = Math.max(0, sizeRef.current.h - metricsRef.current.headerHeight);
+    const bodyW = Math.max(0, sizeRef.current.w - metricsRef.current.gutterWidth);
     const rows = snap.rowAxis.visibleRange(scrollRef.current.y, bodyH, 0);
     const cols = snap.colAxis.visibleRange(scrollRef.current.x, bodyW, 0);
     updateScrollbarsRef.current();
@@ -273,7 +197,7 @@ export function CanvasDataGrid<Row>({
         lastCol: Math.max(cols.start, cols.end - 1),
       });
     }
-  }, [headerHeight, gutterWidth]);
+  }, []);
 
   const scheduleDraw = React.useCallback(() => {
     if (rafRef.current !== 0) return;
@@ -283,28 +207,27 @@ export function CanvasDataGrid<Row>({
     });
   }, []);
 
-  /** Pull scroll offsets out of the scroller and queue a repaint. */
   const syncScroll = React.useCallback(() => {
     const scroller = scrollerRef.current;
     if (!scroller) return;
     scrollRef.current.x = scroller.scrollLeft;
     scrollRef.current.y = scroller.scrollTop;
-    if (editingRef.current) setScrollState({ x: scroller.scrollLeft, y: scroller.scrollTop });
+    if (model.getState().editing) setScrollState({ x: scroller.scrollLeft, y: scroller.scrollTop });
     scheduleDraw();
-  }, [scheduleDraw]);
+  }, [model, scheduleDraw]);
 
-  // Refresh the snapshot after every render, then queue a paint.
+  // Refresh the draw snapshot after every render, then queue a paint.
   React.useLayoutEffect(() => {
     snapshotRef.current = {
-      columns: columns as readonly ColumnDef<any>[],
-      rows: sortedView as readonly any[],
+      columns: state.columns as readonly ColumnDef<any>[],
+      rows: state.view as readonly any[],
       colAxis,
       rowAxis,
-      selection,
-      sort,
+      selection: state.selection,
+      sort: state.sort,
       hover,
       resizeCol: resizeColRef.current,
-      editing,
+      editing: state.editing ? { row: state.editing.row, col: state.editing.col } : null,
     };
     drawRef.current = draw;
     scheduleDraw();
@@ -354,28 +277,64 @@ export function CanvasDataGrid<Row>({
     return () => observer.disconnect();
   }, [scheduleDraw]);
 
-  // ---- wheel forwarding (native scrollbars + forward wheel) ---------------
-  React.useEffect(() => {
-    const el = wrapperRef.current;
-    if (!el) return;
-    const onWheel = (event: WheelEvent) => {
-      if (event.ctrlKey) return; // let the browser pinch-zoom
-      const scroller = scrollerRef.current;
-      if (!scroller) return;
-      event.preventDefault();
-      scroller.scrollLeft += event.deltaX;
-      scroller.scrollTop += event.deltaY;
-      syncScroll();
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, [syncScroll]);
+  // ---- geometry helpers ---------------------------------------------------
+  const localPoint = (event: { clientX: number; clientY: number }) => {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  };
+
+  const cellAt = (x: number, y: number): CellAddress => ({
+    row: rowAxis.indexAt(scrollRef.current.y + (y - headerHeight)),
+    col: colAxis.indexAt(scrollRef.current.x + (x - gutterWidth)),
+  });
+
+  const ensureVisible = (row: number, col: number) => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const bodyW = scroller.clientWidth - gutterWidth;
+    const bodyH = scroller.clientHeight - headerHeight;
+    const left = colAxis.offsetOf(col);
+    const right = left + colAxis.sizeOf(col);
+    if (left < scroller.scrollLeft) scroller.scrollLeft = left;
+    else if (right > scroller.scrollLeft + bodyW) scroller.scrollLeft = right - bodyW;
+
+    const top = rowAxis.offsetOf(row);
+    const bottom = top + rowAxis.sizeOf(row);
+    if (top < scroller.scrollTop) scroller.scrollTop = top;
+    else if (bottom > scroller.scrollTop + bodyH) scroller.scrollTop = bottom - bodyH;
+    syncScroll();
+  };
+
+  // ---- command dispatch + effects ----------------------------------------
+  const applyEffects = (effects: Effect<Row>[], options?: { refocus?: boolean }) => {
+    const refocus = options?.refocus ?? true;
+    for (const effect of effects) {
+      switch (effect.type) {
+        case "reveal":
+          ensureVisible(effect.row, effect.col);
+          break;
+        case "focusGrid":
+          if (refocus) requestAnimationFrame(() => wrapperRef.current?.focus());
+          break;
+        case "edited":
+          onCellEditRef.current?.({
+            row: effect.row,
+            rowIndex: effect.rowIndex,
+            column: effect.column,
+            value: effect.value,
+            previous: effect.previous,
+          });
+          break;
+      }
+    }
+  };
+
+  const run = (command: Command<Row>, options?: { refocus?: boolean }) => {
+    applyEffects(model.dispatch(command), options);
+  };
 
   // ---- custom scrollbars --------------------------------------------------
-  // Thumbs are positioned imperatively (transform only) so a fast drag costs
-  // zero React renders — the same principle as the canvas repaint.
-  const vTrackRef = React.useRef<HTMLDivElement>(null);
-  const hTrackRef = React.useRef<HTMLDivElement>(null);
   const vThumbRef = React.useRef<HTMLDivElement>(null);
   const hThumbRef = React.useRef<HTMLDivElement>(null);
   const vBarRef = React.useRef({ thumb: 0, travel: 1, maxScroll: 0 });
@@ -385,7 +344,6 @@ export function CanvasDataGrid<Row>({
     const scroller = scrollerRef.current;
     if (!scroller) return;
 
-    // Vertical.
     const v = computeThumb(scroller.clientHeight, scroller.scrollHeight, scroller.scrollTop, MIN_THUMB);
     const vBar = vBarRef.current;
     const vEl = vThumbRef.current;
@@ -398,7 +356,6 @@ export function CanvasDataGrid<Row>({
     vBar.travel = v.travel;
     vBar.maxScroll = v.maxScroll;
 
-    // Horizontal.
     const h = computeThumb(scroller.clientWidth, scroller.scrollWidth, scroller.scrollLeft, MIN_THUMB);
     const hBar = hBarRef.current;
     const hEl = hThumbRef.current;
@@ -457,319 +414,45 @@ export function CanvasDataGrid<Row>({
     syncScroll();
   };
 
-  // ---- geometry helpers ---------------------------------------------------
-  const clampRow = React.useCallback((i: number) => Math.max(0, Math.min(rows.length - 1, i)), [rows.length]);
-  const clampCol = React.useCallback((i: number) => Math.max(0, Math.min(columns.length - 1, i)), [columns.length]);
-
-  const localPoint = (event: { clientX: number; clientY: number }) => {
-    const rect = canvasRef.current?.getBoundingClientRect();
-    if (!rect) return { x: 0, y: 0 };
-    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
-  };
-
-  const applySelection = React.useCallback(
-    (next: SelectionRange) => {
-      const prev = selectionRef.current;
-      if (
-        prev.anchorRow === next.anchorRow &&
-        prev.anchorCol === next.anchorCol &&
-        prev.extentRow === next.extentRow &&
-        prev.extentCol === next.extentCol &&
-        prev.focusRow === next.focusRow &&
-        prev.focusCol === next.focusCol
-      ) {
-        return;
-      }
-      selectionRef.current = next;
-      setSelectionState(next);
-      onSelectionChangeRef.current?.(next);
-    },
-    [],
-  );
-
-  const ensureVisible = (row: number, col: number) => {
-    const scroller = scrollerRef.current;
-    if (!scroller) return;
-    const bodyW = scroller.clientWidth - gutterWidth;
-    const bodyH = scroller.clientHeight - headerHeight;
-    const left = colAxis.offsetOf(col);
-    const right = left + colAxis.sizeOf(col);
-    if (left < scroller.scrollLeft) scroller.scrollLeft = left;
-    else if (right > scroller.scrollLeft + bodyW) scroller.scrollLeft = right - bodyW;
-
-    const top = rowAxis.offsetOf(row);
-    const bottom = top + rowAxis.sizeOf(row);
-    if (top < scroller.scrollTop) scroller.scrollTop = top;
-    else if (bottom > scroller.scrollTop + bodyH) scroller.scrollTop = bottom - bodyH;
-    syncScroll();
-  };
-
-  // ---- editing ------------------------------------------------------------
-  const beginEdit = (addr: CellAddress, seed: string | null, selectAll: boolean) => {
-    const col = columns[addr.col];
-    const row = sortedView[addr.row];
-    if (!col || row === undefined || col.field === undefined) return;
-    applySelection(singleCellSelection(addr.row, addr.col));
-    const scroller = scrollerRef.current;
-    if (scroller) setScrollState({ x: scroller.scrollLeft, y: scroller.scrollTop });
-    selectAllOnFocusRef.current = selectAll;
-    setEditText(seed ?? editTextFor(col, resolveValue(col, row, addr.row)));
-    editingRef.current = addr;
-    setEditing(addr);
-    scheduleDraw();
-  };
-
-  const cancelEdit = () => {
-    if (!editingRef.current) return;
-    editingRef.current = null;
-    setEditing(null);
-    scheduleDraw();
-    requestAnimationFrame(() => wrapperRef.current?.focus());
-  };
-
-  const commitEdit = (refocus = true) => {
-    const addr = editingRef.current;
-    if (!addr) return;
-    editingRef.current = null;
-    const col = columns[addr.col];
-    const row = sortedView[addr.row];
-    if (col && row !== undefined && col.field !== undefined) {
-      const previous = resolveValue(col, row, addr.row);
-      const value = parseEditedValue(col, editText);
-      if (value !== previous) {
-        (row as Record<string, unknown>)[col.field] = value;
-        onCellEditRef.current?.({
-          row,
-          rowIndex: addr.row,
-          column: col,
-          value,
-          previous,
-        });
-      }
-    }
-    setEditing(null);
-    scheduleDraw();
-    if (refocus) requestAnimationFrame(() => wrapperRef.current?.focus());
-  };
-
+  // ---- wheel forwarding ---------------------------------------------------
   React.useEffect(() => {
-    if (!editing) return;
+    const el = wrapperRef.current;
+    if (!el) return;
+    const onWheel = (event: WheelEvent) => {
+      if (event.ctrlKey) return;
+      const scroller = scrollerRef.current;
+      if (!scroller) return;
+      event.preventDefault();
+      scroller.scrollLeft += event.deltaX;
+      scroller.scrollTop += event.deltaY;
+      syncScroll();
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [syncScroll]);
+
+  // ---- selection-change notification --------------------------------------
+  const prevSelectionRef = React.useRef<SelectionRange | null>(null);
+  React.useEffect(() => {
+    if (prevSelectionRef.current === state.selection) return;
+    prevSelectionRef.current = state.selection;
+    onSelectionChangeRef.current?.(state.selection);
+  }, [state.selection]);
+
+  // ---- editing editor focus ----------------------------------------------
+  const editingKey = state.editing ? `${state.editing.row}:${state.editing.col}` : null;
+  React.useEffect(() => {
+    if (!editingKey) return;
     const input = editorRef.current;
     if (!input) return;
     input.focus();
-    if (selectAllOnFocusRef.current) input.select();
+    if (model.getState().editing?.selectAll) input.select();
     else {
       const len = input.value.length;
       input.setSelectionRange(len, len);
     }
-  }, [editing]);
-
-  // ---- keyboard -----------------------------------------------------------
-  /**
-   * Arrow-style movement.
-   *  - plain: collapse to the moved focus (a single cell).
-   *  - shift: move the *extent* and keep the anchor, extending the rectangle;
-   *    focus is pulled back inside the new rectangle if the range shrank.
-   */
-  const moveFocus = (dr: number, dc: number, extend: boolean) => {
-    const sel = selectionRef.current;
-    if (!extend) {
-      const row = clampRow(sel.focusRow + dr);
-      const col = clampCol(sel.focusCol + dc);
-      applySelection(singleCellSelection(row, col));
-      ensureVisible(row, col);
-      return;
-    }
-    const extentRow = clampRow(sel.extentRow + dr);
-    const extentCol = clampCol(sel.extentCol + dc);
-    const rect = normalizeSelection({ ...sel, extentRow, extentCol });
-    const focus = clampToRect(rect, sel.focusRow, sel.focusCol);
-    applySelection({ ...sel, extentRow, extentCol, focusRow: focus.row, focusCol: focus.col });
-    ensureVisible(extentRow, extentCol);
-  };
-
-  /**
-   * `Enter` (vertical) and `Tab` (horizontal) navigation, with `Shift` to go
-   * backwards. Movement stays inside the selection rectangle and wraps:
-   *  - `Tab`   scans row-major,    wrapping to the next *row*.
-   *  - `Enter` scans column-major, wrapping to the next *column*.
-   *
-   * When the selection is a single cell there is nothing to cycle through, so
-   * the selection itself moves (wrapping across the whole grid).
-   */
-  const scanMove = (axis: "h" | "v", forward: boolean) => {
-    const sel = selectionRef.current;
-    const rect = normalizeSelection(sel);
-    const single = rect.rowMin === rect.rowMax && rect.colMin === rect.colMax;
-    // A single-cell selection has nothing to cycle through, so navigate the
-    // whole grid instead (and move the selection with the focus).
-    const domain = single ? fullGrid(columns.length, rows.length) : rect;
-    const focus = scanCell(domain, { row: sel.focusRow, col: sel.focusCol }, axis, forward);
-    const { row, col } = focus;
-    applySelection(single ? singleCellSelection(row, col) : { ...sel, focusRow: row, focusCol: col });
-    ensureVisible(row, col);
-  };
-
-  const forEachSelected = (fn: (row: number, col: number) => void) => {
-    const rect = normalizeSelection(selectionRef.current);
-    const rowMax = Math.min(rect.rowMax, rows.length - 1);
-    const colMax = Math.min(rect.colMax, columns.length - 1);
-    for (let r = rect.rowMin; r <= rowMax; r++) {
-      for (let c = rect.colMin; c <= colMax; c++) fn(r, c);
-    }
-  };
-
-  const clearSelection = () => {
-    forEachSelected((r, c) => {
-      const col = columns[c];
-      const row = sortedView[r];
-      if (!col || row === undefined || col.field === undefined) return;
-      (row as Record<string, unknown>)[col.field] = null;
-    });
-    scheduleDraw();
-  };
-
-  const selectionToTsv = (): string => {
-    const rect = normalizeSelection(selectionRef.current);
-    const rowMax = Math.min(rect.rowMax, rows.length - 1);
-    const colMax = Math.min(rect.colMax, columns.length - 1);
-    const lines: string[] = [];
-    for (let r = rect.rowMin; r <= rowMax; r++) {
-      const cells: string[] = [];
-      for (let c = rect.colMin; c <= colMax; c++) {
-        const col = columns[c];
-        const row = sortedView[r];
-        if (!col || row === undefined) {
-          cells.push("");
-          continue;
-        }
-        const value = resolveValue(col, row, r);
-        cells.push(value === null || value === undefined ? "" : String(value));
-      }
-      lines.push(cells.join("\t"));
-    }
-    return lines.join("\n");
-  };
-
-  const pasteText = (text: string) => {
-    const start = selectionRef.current;
-    const matrix = text.replace(/\r/g, "").split("\n").map((line) => line.split("\t"));
-    matrix.forEach((cells, dr) => {
-      cells.forEach((cellText, dc) => {
-        const r = start.focusRow + dr;
-        const c = start.focusCol + dc;
-        if (r >= rows.length || c >= columns.length) return;
-        const col = columns[c];
-        const row = sortedView[r];
-        if (!col || row === undefined || col.field === undefined) return;
-        (row as Record<string, unknown>)[col.field] = parseEditedValue(col, cellText);
-      });
-    });
-    scheduleDraw();
-  };
-
-  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (editingRef.current) return;
-    if (rows.length === 0 || columns.length === 0) return;
-
-    const sel = selectionRef.current;
-    const mod = event.ctrlKey || event.metaKey;
-    const pageRows = Math.max(1, Math.floor((sizeRef.current.h - headerHeight) / rowHeight) - 1);
-
-    if (mod && (event.key === "c" || event.key === "C")) {
-      event.preventDefault();
-      void navigator.clipboard?.writeText(selectionToTsv());
-      return;
-    }
-    if (mod && (event.key === "v" || event.key === "V")) {
-      event.preventDefault();
-      void (async () => {
-        try {
-          const text = await navigator.clipboard.readText();
-          if (text) pasteText(text);
-        } catch {
-          /* clipboard permission denied — ignore */
-        }
-      })();
-      return;
-    }
-    if (mod && (event.key === "a" || event.key === "A")) {
-      event.preventDefault();
-      applySelection({
-        anchorRow: 0,
-        anchorCol: 0,
-        extentRow: rows.length - 1,
-        extentCol: columns.length - 1,
-        focusRow: 0,
-        focusCol: 0,
-      });
-      return;
-    }
-
-    let handled = true;
-
-    switch (event.key) {
-      case "ArrowUp":
-        moveFocus(-1, 0, event.shiftKey);
-        break;
-      case "ArrowDown":
-        moveFocus(1, 0, event.shiftKey);
-        break;
-      case "ArrowLeft":
-        moveFocus(0, -1, event.shiftKey);
-        break;
-      case "ArrowRight":
-        moveFocus(0, 1, event.shiftKey);
-        break;
-      case "PageUp":
-        moveFocus(-pageRows, 0, event.shiftKey);
-        break;
-      case "PageDown":
-        moveFocus(pageRows, 0, event.shiftKey);
-        break;
-      case "Home":
-        moveFocus(mod ? -sel.focusRow : 0, -sel.focusCol, event.shiftKey);
-        break;
-      case "End":
-        moveFocus(mod ? rows.length - 1 - sel.focusRow : 0, columns.length - 1 - sel.focusCol, event.shiftKey);
-        break;
-      case "Tab":
-        scanMove("h", !event.shiftKey);
-        break;
-      case "Enter":
-        scanMove("v", !event.shiftKey);
-        break;
-      case "F2":
-        beginEdit({ row: sel.focusRow, col: sel.focusCol }, null, true);
-        break;
-      case "Delete":
-      case "Backspace":
-        clearSelection();
-        break;
-      default:
-        if (event.key.length === 1 && !mod && !event.altKey) {
-          beginEdit({ row: sel.focusRow, col: sel.focusCol }, event.key, false);
-        } else {
-          handled = false;
-        }
-    }
-    if (handled) event.preventDefault();
-  };
-
-  const handleEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      commitEdit(true);
-      scanMove("v", !event.shiftKey);
-    } else if (event.key === "Tab") {
-      event.preventDefault();
-      commitEdit(true);
-      scanMove("h", !event.shiftKey);
-    } else if (event.key === "Escape") {
-      event.preventDefault();
-      cancelEdit();
-    }
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingKey]);
 
   // ---- pointer ------------------------------------------------------------
   const handlePointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
@@ -794,50 +477,29 @@ export function CanvasDataGrid<Row>({
 
     // Row gutter: select the whole row.
     if (x < gutterWidth && y >= headerHeight) {
-      const row = clampRow(rowAxis.indexAt(scrollRef.current.y + (y - headerHeight)));
-      const lastCol = Math.max(0, columns.length - 1);
-      applySelection({ anchorRow: row, anchorCol: 0, extentRow: row, extentCol: lastCol, focusRow: row, focusCol: 0 });
-      scheduleDraw();
+      run({ type: "selectRow", row: rowAxis.indexAt(scrollRef.current.y + (y - headerHeight)) });
       return;
     }
 
     // Corner: select everything.
     if (x < gutterWidth && y < headerHeight) {
-      applySelection({
-        anchorRow: 0,
-        anchorCol: 0,
-        extentRow: rows.length - 1,
-        extentCol: columns.length - 1,
-        focusRow: 0,
-        focusCol: 0,
-      });
-      scheduleDraw();
+      run({ type: "selectAll" });
       return;
     }
 
-    // Body.
-    if (editingRef.current) commitEdit();
-    const col = clampCol(colAxis.indexAt(scrollRef.current.x + (x - gutterWidth)));
-    const row = clampRow(rowAxis.indexAt(scrollRef.current.y + (y - headerHeight)));
-    dragAnchorRef.current = { row, col };
-    applySelection(singleCellSelection(row, col));
+    // Body: collapse to the pressed cell and begin a marquee.
+    if (model.getState().editing) run({ type: "commitEdit" }, { refocus: false });
+    const cell = cellAt(x, y);
+    dragAnchorRef.current = cell;
     dragRef.current = true;
-    scheduleDraw();
+    run({ type: "selectCell", row: cell.row, col: cell.col });
   };
 
   const handlePointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const resize = resizeSessionRef.current;
     if (resize) {
-      const col = columns[resize.col];
-      const min = col?.minWidth ?? 56;
-      const max = col?.maxWidth ?? 800;
-      const next = Math.max(min, Math.min(max, resize.startWidth + (event.clientX - resize.startX)));
-      setWidths((prev) => {
-        if (prev[resize.col] === next) return prev;
-        const copy = prev.slice();
-        copy[resize.col] = next;
-        return copy;
-      });
+      const width = resize.startWidth + (event.clientX - resize.startX);
+      run({ type: "setColumnWidth", col: resize.col, width });
       return;
     }
 
@@ -845,24 +507,19 @@ export function CanvasDataGrid<Row>({
 
     if (dragRef.current) {
       if (x < gutterWidth || y < headerHeight) return;
-      const col = clampCol(colAxis.indexAt(scrollRef.current.x + (x - gutterWidth)));
-      const row = clampRow(rowAxis.indexAt(scrollRef.current.y + (y - headerHeight)));
-      // anchor = where the drag began, extent = the cursor, focus = the anchor.
+      const cell = cellAt(x, y);
       const anchor = dragAnchorRef.current;
-      applySelection({
-        anchorRow: anchor.row,
-        anchorCol: anchor.col,
-        extentRow: row,
-        extentCol: col,
-        focusRow: anchor.row,
-        focusCol: anchor.col,
-      });
+      run({ type: "selectRange", anchor, extent: cell, focus: anchor });
       return;
     }
 
-    const row = y >= headerHeight ? clampRow(rowAxis.indexAt(scrollRef.current.y + (y - headerHeight))) : -1;
-    const col = x >= gutterWidth ? clampCol(colAxis.indexAt(scrollRef.current.x + (x - gutterWidth))) : -1;
-    if (row !== hover.row || col !== hover.col) setHover({ row, col });
+    const row = y >= headerHeight ? rowAxis.indexAt(scrollRef.current.y + (y - headerHeight)) : -1;
+    const col = x >= gutterWidth ? colAxis.indexAt(scrollRef.current.x + (x - gutterWidth)) : -1;
+    if (row !== hover.row || col !== hover.col) {
+      const next = { row, col };
+      hoverRef.current = next;
+      setHover(next);
+    }
   };
 
   const handlePointerUp = (event: React.PointerEvent<HTMLCanvasElement>) => {
@@ -873,61 +530,189 @@ export function CanvasDataGrid<Row>({
       scheduleDraw();
     }
     if (dragRef.current) {
-      // The pointer gesture is over, so anchor and extent are interchangeable:
-      // normalise anchor to the top-left corner and extent to the bottom-right.
-      const sel = selectionRef.current;
+      // The gesture is over — anchor and extent are interchangeable, so
+      // normalise anchor to the top-left and extent to the bottom-right.
+      const sel = model.getState().selection;
       const rect = normalizeSelection(sel);
-      applySelection({
-        anchorRow: rect.rowMin,
-        anchorCol: rect.colMin,
-        extentRow: rect.rowMax,
-        extentCol: rect.colMax,
-        focusRow: sel.focusRow,
-        focusCol: sel.focusCol,
+      run({
+        type: "selectRange",
+        anchor: { row: rect.rowMin, col: rect.colMin },
+        extent: { row: rect.rowMax, col: rect.colMax },
+        focus: { row: sel.focusRow, col: sel.focusCol },
       });
     }
     dragRef.current = false;
     if (pendingSortRef.current >= 0) {
-      const col = columns[pendingSortRef.current];
+      const col = state.columns[pendingSortRef.current];
       pendingSortRef.current = -1;
-      if (col && col.sortable !== false) {
-        setSort((prev) => {
-          if (!prev || prev.columnId !== col.id) return { columnId: col.id, direction: "asc" };
-          if (prev.direction === "asc") return { columnId: col.id, direction: "desc" };
-          return null;
-        });
-      }
+      if (col) run({ type: "sortColumn", columnId: col.id });
     }
     canvasRef.current?.releasePointerCapture(event.pointerId);
   };
 
   const handlePointerLeave = () => {
     if (dragRef.current) return;
-    setHover((prev) => (prev.row === -1 && prev.col === -1 ? prev : NO_HOVER));
+    if (hoverRef.current.row === -1 && hoverRef.current.col === -1) return;
+    hoverRef.current = NO_HOVER;
+    setHover(NO_HOVER);
   };
 
   const handleDoubleClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
     const { x, y } = localPoint(event);
     if (x < gutterWidth || y < headerHeight) return;
-    const col = clampCol(colAxis.indexAt(scrollRef.current.x + (x - gutterWidth)));
-    const row = clampRow(rowAxis.indexAt(scrollRef.current.y + (y - headerHeight)));
-    beginEdit({ row, col }, null, true);
+    const cell = cellAt(x, y);
+    run({ type: "selectCell", row: cell.row, col: cell.col });
+    run({ type: "beginEdit", seed: null, selectAll: true });
+  };
+
+  const clampCol = (i: number) => Math.max(0, Math.min(state.columns.length - 1, i));
+
+  // ---- keyboard -----------------------------------------------------------
+  const selectionToTsv = (): string => {
+    const rect = normalizeSelection(model.getState().selection);
+    const view = model.getState().view;
+    const lines: string[] = [];
+    for (let r = rect.rowMin; r <= Math.min(rect.rowMax, view.length - 1); r++) {
+      const cells: string[] = [];
+      for (let c = rect.colMin; c <= rect.colMax; c++) {
+        const column = state.columns[c];
+        const row = view[r];
+        if (!column || row === undefined) {
+          cells.push("");
+          continue;
+        }
+        const value = column.getValue
+          ? column.getValue(row, r)
+          : column.field
+            ? ((row as Record<string, unknown>)[column.field] as unknown)
+            : null;
+        cells.push(value === null || value === undefined ? "" : String(value));
+      }
+      lines.push(cells.join("\t"));
+    }
+    return lines.join("\n");
+  };
+
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (model.getState().editing) return;
+    if (state.view.length === 0 || state.columns.length === 0) return;
+
+    const sel = model.getState().selection;
+    const mod = event.ctrlKey || event.metaKey;
+    const pageRows = Math.max(1, Math.floor((sizeRef.current.h - headerHeight) / rowHeight) - 1);
+    const lastRow = state.view.length - 1;
+    const lastCol = state.columns.length - 1;
+
+    if (mod && (event.key === "c" || event.key === "C")) {
+      event.preventDefault();
+      void navigator.clipboard?.writeText(selectionToTsv());
+      return;
+    }
+    if (mod && (event.key === "v" || event.key === "V")) {
+      event.preventDefault();
+      void (async () => {
+        try {
+          const text = await navigator.clipboard.readText();
+          if (text) run({ type: "paste", text });
+        } catch {
+          /* clipboard permission denied — ignore */
+        }
+      })();
+      return;
+    }
+    if (mod && (event.key === "a" || event.key === "A")) {
+      event.preventDefault();
+      run({ type: "selectAll" });
+      return;
+    }
+
+    let handled = true;
+    switch (event.key) {
+      case "ArrowUp":
+        run({ type: "move", dr: -1, dc: 0, extend: event.shiftKey });
+        break;
+      case "ArrowDown":
+        run({ type: "move", dr: 1, dc: 0, extend: event.shiftKey });
+        break;
+      case "ArrowLeft":
+        run({ type: "move", dr: 0, dc: -1, extend: event.shiftKey });
+        break;
+      case "ArrowRight":
+        run({ type: "move", dr: 0, dc: 1, extend: event.shiftKey });
+        break;
+      case "PageUp":
+        run({ type: "move", dr: -pageRows, dc: 0, extend: event.shiftKey });
+        break;
+      case "PageDown":
+        run({ type: "move", dr: pageRows, dc: 0, extend: event.shiftKey });
+        break;
+      case "Home":
+        run(
+          mod
+            ? { type: "moveTo", row: 0, col: 0, extend: event.shiftKey }
+            : { type: "moveTo", row: sel.focusRow, col: 0, extend: event.shiftKey },
+        );
+        break;
+      case "End":
+        run(
+          mod
+            ? { type: "moveTo", row: lastRow, col: lastCol, extend: event.shiftKey }
+            : { type: "moveTo", row: sel.focusRow, col: lastCol, extend: event.shiftKey },
+        );
+        break;
+      case "Tab":
+        run({ type: "scan", axis: "h", forward: !event.shiftKey });
+        break;
+      case "Enter":
+        run({ type: "scan", axis: "v", forward: !event.shiftKey });
+        break;
+      case "F2":
+        run({ type: "beginEdit", seed: null, selectAll: true });
+        break;
+      case "Delete":
+      case "Backspace":
+        run({ type: "clearCells" });
+        break;
+      default:
+        if (event.key.length === 1 && !mod && !event.altKey) {
+          run({ type: "beginEdit", seed: event.key, selectAll: false });
+        } else {
+          handled = false;
+        }
+    }
+    if (handled) event.preventDefault();
+  };
+
+  const handleEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      run({ type: "commitEdit" });
+      run({ type: "scan", axis: "v", forward: !event.shiftKey });
+    } else if (event.key === "Tab") {
+      event.preventDefault();
+      run({ type: "commitEdit" });
+      run({ type: "scan", axis: "h", forward: !event.shiftKey });
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      run({ type: "cancelEdit" });
+    }
   };
 
   // ---- editor overlay position -------------------------------------------
+  const editor = state.editing;
   const editorStyle = React.useMemo<React.CSSProperties | undefined>(() => {
-    if (!editing) return undefined;
-    const col = columns[editing.col];
-    const align = col ? (col.align ?? defaultAlign(col.type)) : "left";
+    if (!editor) return undefined;
+    const column = state.columns[editor.col];
+    const align = column?.align ?? (column && ["number", "integer", "currency", "percent"].includes(column.type ?? "") ? "right" : "left");
     return {
-      left: gutterWidth + colAxis.offsetOf(editing.col) - scrollState.x,
-      top: headerHeight + rowAxis.offsetOf(editing.row) - scrollState.y,
-      width: colAxis.sizeOf(editing.col),
-      height: rowAxis.sizeOf(editing.row),
+      left: gutterWidth + colAxis.offsetOf(editor.col) - scrollState.x,
+      top: headerHeight + rowAxis.offsetOf(editor.row) - scrollState.y,
+      width: colAxis.sizeOf(editor.col),
+      height: rowAxis.sizeOf(editor.row),
       padding: "0 9px",
-      textAlign: align,
+      textAlign: align as React.CSSProperties["textAlign"],
     };
-  }, [editing, columns, colAxis, rowAxis, scrollState, gutterWidth, headerHeight]);
+  }, [editor, state.columns, colAxis, rowAxis, scrollState, gutterWidth, headerHeight]);
 
   const contentWidth = gutterWidth + colAxis.total;
   const contentHeight = headerHeight + rowAxis.total;
@@ -937,8 +722,8 @@ export function CanvasDataGrid<Row>({
       ref={wrapperRef}
       tabIndex={0}
       role="grid"
-      aria-rowcount={rows.length}
-      aria-colcount={columns.length}
+      aria-rowcount={state.view.length}
+      aria-colcount={state.columns.length}
       className={cn("relative select-none overflow-hidden outline-none", className)}
       onKeyDown={handleKeyDown}
     >
@@ -961,13 +746,13 @@ export function CanvasDataGrid<Row>({
         onDoubleClick={handleDoubleClick}
       />
 
-      {editing && editorStyle ? (
+      {editor && editorStyle ? (
         <input
           ref={editorRef}
-          value={editText}
-          onChange={(event) => setEditText(event.target.value)}
+          value={editor.text}
+          onChange={(event) => run({ type: "setEditText", text: event.target.value })}
           onKeyDown={handleEditorKeyDown}
-          onBlur={() => commitEdit(false)}
+          onBlur={() => run({ type: "commitEdit" }, { refocus: false })}
           spellCheck={false}
           className="absolute z-20 box-border select-text rounded-[3px] border-2 border-ring bg-background text-[13px] leading-none text-foreground shadow-sm outline-none"
           style={editorStyle}
@@ -975,7 +760,6 @@ export function CanvasDataGrid<Row>({
       ) : null}
 
       <div
-        ref={vTrackRef}
         className="absolute right-0 top-0 touch-none"
         style={{ width: SCROLLBAR, bottom: SCROLLBAR }}
         onPointerDown={(event) => {
@@ -992,7 +776,6 @@ export function CanvasDataGrid<Row>({
       </div>
 
       <div
-        ref={hTrackRef}
         className="absolute bottom-0 left-0 touch-none"
         style={{ height: SCROLLBAR, right: SCROLLBAR }}
         onPointerDown={(event) => {

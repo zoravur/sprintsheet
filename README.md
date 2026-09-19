@@ -53,7 +53,23 @@ Features:
 - `⌘/Ctrl+C` / `⌘/Ctrl+V` of TSV ranges
 - reads shadcn/Tailwind theme tokens and follows dark mode
 
-Modules: `layout.ts` (axis maths + virtualization), `renderer.ts` (canvas paint),
-`format.ts` (value resolution + `Intl` formatting), `theme.ts` (CSS-var bridge),
-`CanvasDataGrid.tsx` (React glue + interactions). Run the checks with
-`bun test` and `bunx tsc --noEmit`.
+### Architecture
+
+The document is a **headless model**, independent of React and the canvas:
+
+- `spreadsheet.ts` — `SpreadsheetState` (rows/view/columns/widths/sort/selection/
+  editing) plus a pure `reduce(state, command)` and an observable
+  `SpreadsheetModel` wrapper. Every interaction is a `Command`
+  (`move`, `scan`, `beginEdit`, `commitEdit`, `sortColumn`, `paste`, …); results
+  are `Effect`s (`reveal`, `focusGrid`, `edited`) that the view plays back.
+- `CanvasDataGrid.tsx` — thin view: builds the model once, subscribes with
+  `useSyncExternalStore`, dispatches commands from DOM events and turns effects
+  into scrolling / focus / callbacks. It owns only presentational state
+  (scroll offsets, hover, in-progress resize).
+
+Supporting pure modules: `layout.ts` (axis maths + virtualization), `renderer.ts`
+(canvas paint), `format.ts` (value resolution + `Intl` formatting), `theme.ts`
+(CSS-var bridge), `navigation.ts` (Enter/Tab scan), `scrollbar.ts` (thumb
+geometry). Because the model is pure it is exhaustively unit-testable — see
+`__tests__/spreadsheet.test.ts`. Run everything with `bun test` and
+`bunx tsc --noEmit`.

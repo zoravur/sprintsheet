@@ -4,6 +4,18 @@ export { fullGrid, scanCell, type Cell, type ScanAxis } from "./navigation";
 export { drawGrid, RESIZE_HANDLE_PX } from "./renderer";
 export { computeThumb, dragScroll, thumbToScroll, type ThumbMetrics } from "./scrollbar";
 export {
+  computeView,
+  editTextFor,
+  initialState,
+  reduce,
+  SpreadsheetModel,
+  type Command,
+  type CommandResult,
+  type Effect,
+  type EditingState,
+  type SpreadsheetState,
+} from "./spreadsheet";
+export {
   getGridTheme,
   readGridTheme,
   refreshGridTheme,
