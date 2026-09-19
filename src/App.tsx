@@ -6,6 +6,7 @@ import {
   createOrders,
   orderColumns,
   searchableFields,
+  type GridStats,
   type SelectionRange,
 } from "@/components/datagrid";
 import { Button } from "@/components/ui/button";
@@ -47,7 +48,7 @@ export function App() {
   const [query, setQuery] = React.useState("");
   const [dark, setDark] = useDarkMode();
   const [selection, setSelection] = React.useState<SelectionRange | null>(null);
-  const [frameMs, setFrameMs] = React.useState(0);
+  const [stats, setStats] = React.useState<GridStats | null>(null);
 
   const filtered = React.useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -58,7 +59,7 @@ export function App() {
   const headers = React.useMemo(() => columns.map((c) => c.header), [columns]);
   const summary = React.useMemo(() => (selection ? summarize(selection, headers) : null), [selection, headers]);
 
-  const handleStats = React.useCallback((ms: number) => setFrameMs(ms), []);
+  const handleStats = React.useCallback((next: GridStats) => setStats(next), []);
   const handleSelection = React.useCallback((next: SelectionRange) => setSelection(next), []);
 
   return (
@@ -84,7 +85,12 @@ export function App() {
 
         <div className="hidden items-center gap-4 text-xs text-muted-foreground md:flex">
           <span className="tabular-nums">{filtered.length.toLocaleString()} rows</span>
-          <span className="tabular-nums">{frameMs.toFixed(1)} ms/frame</span>
+          {stats ? (
+            <span className="tabular-nums">
+              rows {(stats.firstRow + 1).toLocaleString()}–{(stats.lastRow + 1).toLocaleString()}
+            </span>
+          ) : null}
+          <span className="tabular-nums">{stats ? `${stats.frameMs.toFixed(1)} ms/frame` : "—"}</span>
         </div>
 
         <Button
@@ -119,7 +125,7 @@ export function App() {
           <span>Arrow keys to move · type to edit</span>
         )}
         <span className="ml-auto hidden sm:inline">
-          Double-click to edit · drag headers to resize · click headers to sort · ⌘/Ctrl+C and ⌘/Ctrl+V
+          Double-click to edit · drag headers to resize · click headers to sort · drag the scrollbars · ⌘/Ctrl+C / ⌘/Ctrl+V
         </span>
       </footer>
     </div>

@@ -37,6 +37,8 @@ const rows = createOrders(50_000);
 Features:
 
 - virtualized canvas rendering with device-pixel-ratio crispness
+- custom scrollbars (drag / click-to-jump) synced to the canvas with zero
+  React renders per scroll frame
 - frozen column header + row-number gutter
 - cell / range selection, marquee drag, row select, select-all
 - keyboard navigation (arrows, `Shift+Arrows`, `PageUp/Down`, `Home`/`End`, `Tab`)

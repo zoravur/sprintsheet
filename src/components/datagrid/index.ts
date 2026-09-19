@@ -1,6 +1,7 @@
-export { CanvasDataGrid, type CanvasDataGridProps } from "./CanvasDataGrid";
+export { CanvasDataGrid, type CanvasDataGridProps, type GridStats } from "./CanvasDataGrid";
 export { Axis } from "./layout";
 export { drawGrid, RESIZE_HANDLE_PX } from "./renderer";
+export { computeThumb, dragScroll, thumbToScroll, type ThumbMetrics } from "./scrollbar";
 export {
   getGridTheme,
   readGridTheme,

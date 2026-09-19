@@ -20,6 +20,7 @@ import { cn } from "@/lib/utils";
 import { compareValues, defaultAlign, parseEditedValue, resolveValue } from "./format";
 import { Axis } from "./layout";
 import { drawGrid, RESIZE_HANDLE_PX } from "./renderer";
+import { computeThumb, dragScroll, thumbToScroll } from "./scrollbar";
 import { getGridTheme, refreshGridTheme, type GridMetrics, type GridTheme } from "./theme";
 import {
   EMPTY_SELECTION,
@@ -47,8 +48,18 @@ export interface CanvasDataGridProps<Row> {
     previous: CellValue;
   }) => void;
   onSelectionChange?: (selection: SelectionRange) => void;
-  /** Throttled (~5/s) report of how long the last canvas frame took, in ms. */
-  onStats?: (frameMs: number) => void;
+  /** Throttled (~5/s) report of frame cost + which rows/cols are on screen. */
+  onStats?: (stats: GridStats) => void;
+}
+
+export interface GridStats {
+  /** How long the last canvas paint took, in ms. */
+  frameMs: number;
+  /** Inclusive bounds of the rows currently drawn. */
+  firstRow: number;
+  lastRow: number;
+  firstCol: number;
+  lastCol: number;
 }
 
 interface Snapshot {
@@ -70,6 +81,11 @@ interface ResizeSession {
 }
 
 const NO_HOVER: CellAddress = { row: -1, col: -1 };
+
+/** Thickness of the custom scrollbar strips reserved on the right/bottom. */
+const SCROLLBAR = 12;
+/** Smallest thumb length so a huge dataset still yields a grabbable handle. */
+const MIN_THUMB = 28;
 
 function editTextFor(col: ColumnDef<any>, value: CellValue): string {
   if (value === null || value === undefined) return "";
@@ -200,6 +216,7 @@ export function CanvasDataGrid<Row>({
   // ---- imperative draw ----------------------------------------------------
   const drawRef = React.useRef<() => void>(() => {});
   const rafRef = React.useRef(0);
+  const updateScrollbarsRef = React.useRef<() => void>(() => {});
 
   const draw = React.useCallback(() => {
     const ctx = ctxRef.current;
@@ -226,12 +243,23 @@ export function CanvasDataGrid<Row>({
       editing: snap.editing,
     });
     const frameMs = performance.now() - t0;
+    const bodyH = Math.max(0, sizeRef.current.h - headerHeight);
+    const bodyW = Math.max(0, sizeRef.current.w - gutterWidth);
+    const rows = snap.rowAxis.visibleRange(scrollRef.current.y, bodyH, 0);
+    const cols = snap.colAxis.visibleRange(scrollRef.current.x, bodyW, 0);
+    updateScrollbarsRef.current();
     const now = performance.now();
     if (now - lastStatsRef.current > 200) {
       lastStatsRef.current = now;
-      onStatsRef.current?.(frameMs);
+      onStatsRef.current?.({
+        frameMs,
+        firstRow: rows.start,
+        lastRow: Math.max(rows.start, rows.end - 1),
+        firstCol: cols.start,
+        lastCol: Math.max(cols.start, cols.end - 1),
+      });
     }
-  }, []);
+  }, [headerHeight, gutterWidth]);
 
   const scheduleDraw = React.useCallback(() => {
     if (rafRef.current !== 0) return;
@@ -240,6 +268,16 @@ export function CanvasDataGrid<Row>({
       drawRef.current();
     });
   }, []);
+
+  /** Pull scroll offsets out of the scroller and queue a repaint. */
+  const syncScroll = React.useCallback(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    scrollRef.current.x = scroller.scrollLeft;
+    scrollRef.current.y = scroller.scrollTop;
+    if (editingRef.current) setScrollState({ x: scroller.scrollLeft, y: scroller.scrollTop });
+    scheduleDraw();
+  }, [scheduleDraw]);
 
   // Refresh the snapshot after every render, then queue a paint.
   React.useLayoutEffect(() => {
@@ -313,10 +351,97 @@ export function CanvasDataGrid<Row>({
       event.preventDefault();
       scroller.scrollLeft += event.deltaX;
       scroller.scrollTop += event.deltaY;
+      syncScroll();
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
+  }, [syncScroll]);
+
+  // ---- custom scrollbars --------------------------------------------------
+  // Thumbs are positioned imperatively (transform only) so a fast drag costs
+  // zero React renders — the same principle as the canvas repaint.
+  const vTrackRef = React.useRef<HTMLDivElement>(null);
+  const hTrackRef = React.useRef<HTMLDivElement>(null);
+  const vThumbRef = React.useRef<HTMLDivElement>(null);
+  const hThumbRef = React.useRef<HTMLDivElement>(null);
+  const vBarRef = React.useRef({ thumb: 0, travel: 1, maxScroll: 0 });
+  const hBarRef = React.useRef({ thumb: 0, travel: 1, maxScroll: 0 });
+
+  const updateScrollbars = React.useCallback(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+
+    // Vertical.
+    const v = computeThumb(scroller.clientHeight, scroller.scrollHeight, scroller.scrollTop, MIN_THUMB);
+    const vBar = vBarRef.current;
+    const vEl = vThumbRef.current;
+    if (vEl) {
+      if (vBar.thumb !== v.thumb) vEl.style.height = `${v.thumb}px`;
+      vEl.style.transform = `translateY(${v.position}px)`;
+      vEl.style.opacity = v.maxScroll > 0 ? "1" : "0";
+    }
+    vBar.thumb = v.thumb;
+    vBar.travel = v.travel;
+    vBar.maxScroll = v.maxScroll;
+
+    // Horizontal.
+    const h = computeThumb(scroller.clientWidth, scroller.scrollWidth, scroller.scrollLeft, MIN_THUMB);
+    const hBar = hBarRef.current;
+    const hEl = hThumbRef.current;
+    if (hEl) {
+      if (hBar.thumb !== h.thumb) hEl.style.width = `${h.thumb}px`;
+      hEl.style.transform = `translateX(${h.position}px)`;
+      hEl.style.opacity = h.maxScroll > 0 ? "1" : "0";
+    }
+    hBar.thumb = h.thumb;
+    hBar.travel = h.travel;
+    hBar.maxScroll = h.maxScroll;
   }, []);
+  updateScrollbarsRef.current = updateScrollbars;
+
+  const startBarDrag = (event: React.PointerEvent<HTMLDivElement>, axis: "v" | "h") => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const bar = axis === "v" ? vBarRef.current : hBarRef.current;
+    if (bar.maxScroll <= 0 || bar.travel <= 0) return;
+    event.preventDefault();
+
+    const thumbEl = event.currentTarget;
+    const start = axis === "v" ? event.clientY : event.clientX;
+    const startScroll = axis === "v" ? scroller.scrollTop : scroller.scrollLeft;
+    const { travel, maxScroll } = bar;
+
+    thumbEl.setPointerCapture(event.pointerId);
+    const move = (native: PointerEvent) => {
+      const delta = (axis === "v" ? native.clientY : native.clientX) - start;
+      const next = dragScroll(startScroll, delta, travel, maxScroll);
+      if (axis === "v") scroller.scrollTop = next;
+      else scroller.scrollLeft = next;
+      syncScroll();
+    };
+    const end = (native: PointerEvent) => {
+      thumbEl.releasePointerCapture?.(native.pointerId);
+      thumbEl.removeEventListener("pointermove", move);
+      thumbEl.removeEventListener("pointerup", end);
+      thumbEl.removeEventListener("pointercancel", end);
+    };
+    thumbEl.addEventListener("pointermove", move);
+    thumbEl.addEventListener("pointerup", end);
+    thumbEl.addEventListener("pointercancel", end);
+  };
+
+  const jumpBar = (event: React.PointerEvent<HTMLDivElement>, axis: "v" | "h") => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const bar = axis === "v" ? vBarRef.current : hBarRef.current;
+    if (bar.maxScroll <= 0 || bar.travel <= 0) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const along = axis === "v" ? event.clientY - rect.top : event.clientX - rect.left;
+    const scroll = thumbToScroll(along - bar.thumb / 2, bar.travel, bar.maxScroll);
+    if (axis === "v") scroller.scrollTop = scroll;
+    else scroller.scrollLeft = scroll;
+    syncScroll();
+  };
 
   // ---- geometry helpers ---------------------------------------------------
   const clampRow = React.useCallback((i: number) => Math.max(0, Math.min(rows.length - 1, i)), [rows.length]);
@@ -360,6 +485,7 @@ export function CanvasDataGrid<Row>({
     const bottom = top + rowAxis.sizeOf(row);
     if (top < scroller.scrollTop) scroller.scrollTop = top;
     else if (bottom > scroller.scrollTop + bodyH) scroller.scrollTop = bottom - bodyH;
+    syncScroll();
   };
 
   // ---- editing ------------------------------------------------------------
@@ -700,15 +826,6 @@ export function CanvasDataGrid<Row>({
     beginEdit({ row, col }, null, true);
   };
 
-  const handleScroll = () => {
-    const scroller = scrollerRef.current;
-    if (!scroller) return;
-    scrollRef.current.x = scroller.scrollLeft;
-    scrollRef.current.y = scroller.scrollTop;
-    if (editingRef.current) setScrollState({ x: scroller.scrollLeft, y: scroller.scrollTop });
-    scheduleDraw();
-  };
-
   // ---- editor overlay position -------------------------------------------
   const editorStyle = React.useMemo<React.CSSProperties | undefined>(() => {
     if (!editing) return undefined;
@@ -737,7 +854,12 @@ export function CanvasDataGrid<Row>({
       className={cn("relative select-none overflow-hidden outline-none", className)}
       onKeyDown={handleKeyDown}
     >
-      <div ref={scrollerRef} className="absolute inset-0 overflow-auto" onScroll={handleScroll}>
+      <div
+        ref={scrollerRef}
+        className="absolute left-0 top-0 overflow-hidden"
+        style={{ right: SCROLLBAR, bottom: SCROLLBAR }}
+        onScroll={syncScroll}
+      >
         <div style={{ width: contentWidth, height: contentHeight }} aria-hidden />
       </div>
 
@@ -763,6 +885,46 @@ export function CanvasDataGrid<Row>({
           style={editorStyle}
         />
       ) : null}
+
+      <div
+        ref={vTrackRef}
+        className="absolute right-0 top-0 touch-none"
+        style={{ width: SCROLLBAR, bottom: SCROLLBAR }}
+        onPointerDown={(event) => {
+          if (event.target === event.currentTarget) jumpBar(event, "v");
+        }}
+      >
+        <div
+          ref={vThumbRef}
+          role="scrollbar"
+          aria-orientation="vertical"
+          onPointerDown={(event) => startBarDrag(event, "v")}
+          className="absolute left-[3px] right-[3px] top-0 cursor-grab rounded-full bg-muted-foreground/40 hover:bg-muted-foreground/60 active:cursor-grabbing"
+        />
+      </div>
+
+      <div
+        ref={hTrackRef}
+        className="absolute bottom-0 left-0 touch-none"
+        style={{ height: SCROLLBAR, right: SCROLLBAR }}
+        onPointerDown={(event) => {
+          if (event.target === event.currentTarget) jumpBar(event, "h");
+        }}
+      >
+        <div
+          ref={hThumbRef}
+          role="scrollbar"
+          aria-orientation="horizontal"
+          onPointerDown={(event) => startBarDrag(event, "h")}
+          className="absolute bottom-[3px] left-0 top-[3px] cursor-grab rounded-full bg-muted-foreground/40 hover:bg-muted-foreground/60 active:cursor-grabbing"
+        />
+      </div>
+
+      <div
+        className="absolute bottom-0 right-0 bg-muted-foreground/20"
+        style={{ width: SCROLLBAR, height: SCROLLBAR }}
+        aria-hidden
+      />
     </div>
   );
 }
