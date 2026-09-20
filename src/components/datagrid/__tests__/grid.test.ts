@@ -3,7 +3,6 @@ import { describe, expect, test } from "bun:test";
 import { compareValues, formatCell, parseEditedValue, resolveValue } from "../format";
 import { Axis } from "../layout";
 import { fullGrid, scanCell } from "../navigation";
-import { computeThumb, dragScroll, thumbToScroll } from "../scrollbar";
 import { clampToRect, normalizeSelection, singleCellSelection } from "../types";
 import type { ColumnDef } from "../types";
 
@@ -246,72 +245,3 @@ describe("compareValues", () => {
   });
 });
 
-describe("computeThumb", () => {
-  test("proportional thumb plus travel range", () => {
-    const m = computeThumb(500, 5000, 0, 28);
-    expect(m.thumb).toBe(50);
-    expect(m.maxScroll).toBe(4500);
-    expect(m.travel).toBe(450);
-    expect(m.position).toBe(0);
-  });
-
-  test("position tracks scroll across the whole travel", () => {
-    expect(computeThumb(500, 5000, 2250, 28).position).toBe(225);
-    expect(computeThumb(500, 5000, 4500, 28).position).toBe(450);
-  });
-
-  test("no overflow -> full-length thumb, zero travel", () => {
-    const m = computeThumb(500, 400, 0, 28);
-    expect(m.thumb).toBe(500);
-    expect(m.travel).toBe(0);
-    expect(m.maxScroll).toBe(0);
-    expect(m.position).toBe(0);
-  });
-
-  test("min thumb keeps huge datasets grabbable", () => {
-    // 500/100000 * 500 = 2.5px -> clamped up to 28px.
-    expect(computeThumb(500, 100_000, 0, 28).thumb).toBe(28);
-  });
-
-  test("thumb never exceeds the viewport", () => {
-    expect(computeThumb(20, 1000, 0, 28).thumb).toBe(20);
-  });
-
-  test("clamps out-of-range scroll", () => {
-    expect(computeThumb(500, 5000, 99999, 28).position).toBe(450);
-    expect(computeThumb(500, 5000, -50, 28).position).toBe(0);
-  });
-});
-
-describe("thumbToScroll", () => {
-  test("maps thumb position back to scroll", () => {
-    expect(thumbToScroll(225, 450, 4500)).toBe(2250);
-    expect(thumbToScroll(450, 450, 4500)).toBe(4500);
-  });
-
-  test("clamps out-of-range positions", () => {
-    expect(thumbToScroll(-100, 450, 4500)).toBe(0);
-    expect(thumbToScroll(9999, 450, 4500)).toBe(4500);
-  });
-
-  test("degenerate travel does nothing", () => {
-    expect(thumbToScroll(100, 0, 4500)).toBe(0);
-  });
-});
-
-describe("dragScroll", () => {
-  test("scales the pixel delta by content ratio", () => {
-    // travel 450px represents 4500px of content -> 1px drag = 10px scroll.
-    expect(dragScroll(0, 45, 450, 4500)).toBe(450);
-    expect(dragScroll(1000, 45, 450, 4500)).toBe(1450);
-  });
-
-  test("clamps to the scrollable range", () => {
-    expect(dragScroll(0, -1000, 450, 4500)).toBe(0);
-    expect(dragScroll(0, 99999, 450, 4500)).toBe(4500);
-  });
-
-  test("degenerate travel keeps the start offset", () => {
-    expect(dragScroll(120, 50, 0, 4500)).toBe(120);
-  });
-});

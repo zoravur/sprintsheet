@@ -8,8 +8,12 @@
  *     side effects (scrolling, DOM focus, callbacks);
  *  4. paints the model state to a single 2D canvas inside one rAF.
  *
- * Scroll offsets, hover and column-resize-in-progress stay here because they are
- * presentation, not document state.
+ * Scrolling is the browser's own: a transparent native scroll surface is layered
+ * over the body, and the component only mirrors its `scrollLeft/Top` into a ref
+ * to paint the canvas. The frozen header/gutter/corner stay on the canvas (behind
+ * the surface), so momentum, overscroll and scroll chaining all come for free.
+ * Hover and column-resize-in-progress also stay here — presentation, not document
+ * state.
  */
 
 import * as React from "react";
@@ -18,7 +22,6 @@ import { cn } from "@/lib/utils";
 
 import { Axis } from "./layout";
 import { drawGrid, RESIZE_HANDLE_PX } from "./renderer";
-import { computeThumb, dragScroll, thumbToScroll } from "./scrollbar";
 import { SpreadsheetModel, type Command, type Effect } from "./spreadsheet";
 import { getGridTheme, refreshGridTheme, type GridMetrics, type GridTheme } from "./theme";
 import { normalizeSelection, type CellAddress, type ColumnDef, type SelectionRange, type SortState } from "./types";
@@ -72,11 +75,6 @@ interface ResizeSession {
 }
 
 const NO_HOVER: CellAddress = { row: -1, col: -1 };
-
-/** Thickness of the custom scrollbar strips reserved on the right/bottom. */
-const SCROLLBAR = 12;
-/** Smallest thumb length so a huge dataset still yields a grabbable handle. */
-const MIN_THUMB = 28;
 
 export function CanvasDataGrid<Row>({
   rows,
@@ -154,7 +152,6 @@ export function CanvasDataGrid<Row>({
   // ---- imperative draw ----------------------------------------------------
   const drawRef = React.useRef<() => void>(() => {});
   const rafRef = React.useRef(0);
-  const updateScrollbarsRef = React.useRef<() => void>(() => {});
 
   const draw = React.useCallback(() => {
     const ctx = ctxRef.current;
@@ -185,7 +182,6 @@ export function CanvasDataGrid<Row>({
     const bodyW = Math.max(0, sizeRef.current.w - metricsRef.current.gutterWidth);
     const rows = snap.rowAxis.visibleRange(scrollRef.current.y, bodyH, 0);
     const cols = snap.colAxis.visibleRange(scrollRef.current.x, bodyW, 0);
-    updateScrollbarsRef.current();
     const now = performance.now();
     if (now - lastStatsRef.current > 200) {
       lastStatsRef.current = now;
@@ -241,12 +237,12 @@ export function CanvasDataGrid<Row>({
   }, []);
 
   React.useEffect(() => {
-    const scroller = scrollerRef.current;
+    const wrapper = wrapperRef.current;
     const canvas = canvasRef.current;
-    if (!scroller || !canvas) return;
+    if (!wrapper || !canvas) return;
     const sync = () => {
-      const w = Math.max(0, scroller.clientWidth);
-      const h = Math.max(0, scroller.clientHeight);
+      const w = Math.max(0, wrapper.clientWidth);
+      const h = Math.max(0, wrapper.clientHeight);
       const dpr = window.devicePixelRatio || 1;
       canvas.style.width = `${w}px`;
       canvas.style.height = `${h}px`;
@@ -257,7 +253,7 @@ export function CanvasDataGrid<Row>({
     };
     sync();
     const ro = new ResizeObserver(sync);
-    ro.observe(scroller);
+    ro.observe(wrapper);
     window.addEventListener("resize", sync);
     return () => {
       ro.disconnect();
@@ -292,8 +288,9 @@ export function CanvasDataGrid<Row>({
   const ensureVisible = (row: number, col: number) => {
     const scroller = scrollerRef.current;
     if (!scroller) return;
-    const bodyW = scroller.clientWidth - gutterWidth;
-    const bodyH = scroller.clientHeight - headerHeight;
+    // The scroller is inset to the body, so its client box *is* the visible body.
+    const bodyW = scroller.clientWidth;
+    const bodyH = scroller.clientHeight;
     const left = colAxis.offsetOf(col);
     const right = left + colAxis.sizeOf(col);
     if (left < scroller.scrollLeft) scroller.scrollLeft = left;
@@ -334,87 +331,11 @@ export function CanvasDataGrid<Row>({
     applyEffects(model.dispatch(command), options);
   };
 
-  // ---- custom scrollbars --------------------------------------------------
-  const vThumbRef = React.useRef<HTMLDivElement>(null);
-  const hThumbRef = React.useRef<HTMLDivElement>(null);
-  const vBarRef = React.useRef({ thumb: 0, travel: 1, maxScroll: 0 });
-  const hBarRef = React.useRef({ thumb: 0, travel: 1, maxScroll: 0 });
-
-  const updateScrollbars = React.useCallback(() => {
-    const scroller = scrollerRef.current;
-    if (!scroller) return;
-
-    const v = computeThumb(scroller.clientHeight, scroller.scrollHeight, scroller.scrollTop, MIN_THUMB);
-    const vBar = vBarRef.current;
-    const vEl = vThumbRef.current;
-    if (vEl) {
-      if (vBar.thumb !== v.thumb) vEl.style.height = `${v.thumb}px`;
-      vEl.style.transform = `translateY(${v.position}px)`;
-      vEl.style.opacity = v.maxScroll > 0 ? "1" : "0";
-    }
-    vBar.thumb = v.thumb;
-    vBar.travel = v.travel;
-    vBar.maxScroll = v.maxScroll;
-
-    const h = computeThumb(scroller.clientWidth, scroller.scrollWidth, scroller.scrollLeft, MIN_THUMB);
-    const hBar = hBarRef.current;
-    const hEl = hThumbRef.current;
-    if (hEl) {
-      if (hBar.thumb !== h.thumb) hEl.style.width = `${h.thumb}px`;
-      hEl.style.transform = `translateX(${h.position}px)`;
-      hEl.style.opacity = h.maxScroll > 0 ? "1" : "0";
-    }
-    hBar.thumb = h.thumb;
-    hBar.travel = h.travel;
-    hBar.maxScroll = h.maxScroll;
-  }, []);
-  updateScrollbarsRef.current = updateScrollbars;
-
-  const startBarDrag = (event: React.PointerEvent<HTMLDivElement>, axis: "v" | "h") => {
-    const scroller = scrollerRef.current;
-    if (!scroller) return;
-    const bar = axis === "v" ? vBarRef.current : hBarRef.current;
-    if (bar.maxScroll <= 0 || bar.travel <= 0) return;
-    event.preventDefault();
-
-    const thumbEl = event.currentTarget;
-    const start = axis === "v" ? event.clientY : event.clientX;
-    const startScroll = axis === "v" ? scroller.scrollTop : scroller.scrollLeft;
-    const { travel, maxScroll } = bar;
-
-    thumbEl.setPointerCapture(event.pointerId);
-    const move = (native: PointerEvent) => {
-      const delta = (axis === "v" ? native.clientY : native.clientX) - start;
-      const next = dragScroll(startScroll, delta, travel, maxScroll);
-      if (axis === "v") scroller.scrollTop = next;
-      else scroller.scrollLeft = next;
-      syncScroll();
-    };
-    const end = (native: PointerEvent) => {
-      thumbEl.releasePointerCapture?.(native.pointerId);
-      thumbEl.removeEventListener("pointermove", move);
-      thumbEl.removeEventListener("pointerup", end);
-      thumbEl.removeEventListener("pointercancel", end);
-    };
-    thumbEl.addEventListener("pointermove", move);
-    thumbEl.addEventListener("pointerup", end);
-    thumbEl.addEventListener("pointercancel", end);
-  };
-
-  const jumpBar = (event: React.PointerEvent<HTMLDivElement>, axis: "v" | "h") => {
-    const scroller = scrollerRef.current;
-    if (!scroller) return;
-    const bar = axis === "v" ? vBarRef.current : hBarRef.current;
-    if (bar.maxScroll <= 0 || bar.travel <= 0) return;
-    const rect = event.currentTarget.getBoundingClientRect();
-    const along = axis === "v" ? event.clientY - rect.top : event.clientX - rect.left;
-    const scroll = thumbToScroll(along - bar.thumb / 2, bar.travel, bar.maxScroll);
-    if (axis === "v") scroller.scrollTop = scroll;
-    else scroller.scrollLeft = scroll;
-    syncScroll();
-  };
-
-  // ---- wheel forwarding ---------------------------------------------------
+  // ---- wheel over the frozen strips ---------------------------------------
+  // The body scrolls natively (the scroller is the pointer target there, so the
+  // browser owns momentum/overscroll). The header/gutter/corner are painted on
+  // the canvas, which is *not* inside the scroller, so a wheel event landing
+  // there would do nothing. Forward only those, leaving the body to the browser.
   React.useEffect(() => {
     const el = wrapperRef.current;
     if (!el) return;
@@ -422,6 +343,7 @@ export function CanvasDataGrid<Row>({
       if (event.ctrlKey) return;
       const scroller = scrollerRef.current;
       if (!scroller) return;
+      if (scroller.contains(event.target as Node)) return; // native handles the body
       event.preventDefault();
       scroller.scrollLeft += event.deltaX;
       scroller.scrollTop += event.deltaY;
@@ -455,9 +377,17 @@ export function CanvasDataGrid<Row>({
   }, [editingKey]);
 
   // ---- pointer ------------------------------------------------------------
-  const handlePointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    canvasRef.current?.setPointerCapture(event.pointerId);
+  // These handlers are bound to both the canvas (which owns the frozen
+  // header/gutter/corner strips) and the native scroll surface (which owns the
+  // body). Only the topmost element under the pointer fires, so there is no
+  // double-handling; coordinates come from `localPoint` either way.
+  const handlePointerDown = (event: React.PointerEvent<HTMLElement>) => {
     wrapperRef.current?.focus();
+    // Pointer capture lets the marquee/resize gestures keep tracking outside the
+    // element. Touch is deliberately left uncaptured so the browser can pan the
+    // scroll surface natively.
+    const mouse = event.pointerType === "mouse";
+    if (mouse) event.currentTarget.setPointerCapture(event.pointerId);
     const { x, y } = localPoint(event);
 
     // Column header: resize handle or (deferred) sort.
@@ -487,15 +417,16 @@ export function CanvasDataGrid<Row>({
       return;
     }
 
-    // Body: collapse to the pressed cell and begin a marquee. Any open edit is
-    // committed by the model as part of `selectCell`.
+    // Body: collapse to the pressed cell. Mouse presses continue into a marquee;
+    // touch just selects (so a tap works) and leaves the pan to the browser. Any
+    // open edit is committed by the model as part of `selectCell`.
     const cell = cellAt(x, y);
     dragAnchorRef.current = cell;
-    dragRef.current = true;
+    dragRef.current = mouse;
     run({ type: "selectCell", row: cell.row, col: cell.col });
   };
 
-  const handlePointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
+  const handlePointerMove = (event: React.PointerEvent<HTMLElement>) => {
     const resize = resizeSessionRef.current;
     if (resize) {
       const width = resize.startWidth + (event.clientX - resize.startX);
@@ -522,7 +453,7 @@ export function CanvasDataGrid<Row>({
     }
   };
 
-  const handlePointerUp = (event: React.PointerEvent<HTMLCanvasElement>) => {
+  const handlePointerUp = (event: React.PointerEvent<HTMLElement>) => {
     if (resizeSessionRef.current) {
       resizeSessionRef.current = null;
       resizeColRef.current = -1;
@@ -547,7 +478,8 @@ export function CanvasDataGrid<Row>({
       pendingSortRef.current = -1;
       if (col) run({ type: "sortColumn", columnId: col.id });
     }
-    canvasRef.current?.releasePointerCapture(event.pointerId);
+    const target = event.currentTarget;
+    if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
   };
 
   const handlePointerLeave = () => {
@@ -557,7 +489,7 @@ export function CanvasDataGrid<Row>({
     setHover(NO_HOVER);
   };
 
-  const handleDoubleClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleDoubleClick = (event: React.MouseEvent<HTMLElement>) => {
     const { x, y } = localPoint(event);
     if (x < gutterWidth || y < headerHeight) return;
     const cell = cellAt(x, y);
@@ -709,9 +641,6 @@ export function CanvasDataGrid<Row>({
     };
   }, [editor, state.columns, colAxis, rowAxis, scrollState, gutterWidth, headerHeight]);
 
-  const contentWidth = gutterWidth + colAxis.total;
-  const contentHeight = headerHeight + rowAxis.total;
-
   return (
     <div
       ref={wrapperRef}
@@ -722,15 +651,8 @@ export function CanvasDataGrid<Row>({
       className={cn("relative select-none overflow-hidden outline-none", className)}
       onKeyDown={handleKeyDown}
     >
-      <div
-        ref={scrollerRef}
-        className="absolute left-0 top-0 overflow-hidden"
-        style={{ right: SCROLLBAR, bottom: SCROLLBAR }}
-        onScroll={syncScroll}
-      >
-        <div style={{ width: contentWidth, height: contentHeight }} aria-hidden />
-      </div>
-
+      {/* Canvas sits behind: it paints the frozen header/gutter/corner strips and
+          the body, and owns pointer handling for the strips. */}
       <canvas
         ref={canvasRef}
         className="absolute left-0 top-0 block touch-none"
@@ -740,6 +662,24 @@ export function CanvasDataGrid<Row>({
         onPointerLeave={handlePointerLeave}
         onDoubleClick={handleDoubleClick}
       />
+
+      {/* Native scroll surface, layered on top of the body so the browser owns
+          momentum, overscroll and scroll chaining. It is inset to the body
+          (below the header, right of the gutter) so its scrollbars land there
+          and the frozen strips stay interactive on the canvas. */}
+      <div
+        ref={scrollerRef}
+        className="grid-scroll absolute overflow-scroll"
+        style={{ left: gutterWidth, top: headerHeight, right: 0, bottom: 0 }}
+        onScroll={syncScroll}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerLeave}
+        onDoubleClick={handleDoubleClick}
+      >
+        <div style={{ width: colAxis.total, height: rowAxis.total }} aria-hidden />
+      </div>
 
       {editor && editorStyle ? (
         /* No onKeyDown here on purpose: keys are handled once, on the wrapper. */
@@ -753,44 +693,6 @@ export function CanvasDataGrid<Row>({
           style={editorStyle}
         />
       ) : null}
-
-      <div
-        className="absolute right-0 top-0 touch-none"
-        style={{ width: SCROLLBAR, bottom: SCROLLBAR }}
-        onPointerDown={(event) => {
-          if (event.target === event.currentTarget) jumpBar(event, "v");
-        }}
-      >
-        <div
-          ref={vThumbRef}
-          role="scrollbar"
-          aria-orientation="vertical"
-          onPointerDown={(event) => startBarDrag(event, "v")}
-          className="absolute left-[3px] right-[3px] top-0 cursor-grab rounded-full bg-muted-foreground/40 hover:bg-muted-foreground/60 active:cursor-grabbing"
-        />
-      </div>
-
-      <div
-        className="absolute bottom-0 left-0 touch-none"
-        style={{ height: SCROLLBAR, right: SCROLLBAR }}
-        onPointerDown={(event) => {
-          if (event.target === event.currentTarget) jumpBar(event, "h");
-        }}
-      >
-        <div
-          ref={hThumbRef}
-          role="scrollbar"
-          aria-orientation="horizontal"
-          onPointerDown={(event) => startBarDrag(event, "h")}
-          className="absolute bottom-[3px] left-0 top-[3px] cursor-grab rounded-full bg-muted-foreground/40 hover:bg-muted-foreground/60 active:cursor-grabbing"
-        />
-      </div>
-
-      <div
-        className="absolute bottom-0 right-0 bg-muted-foreground/20"
-        style={{ width: SCROLLBAR, height: SCROLLBAR }}
-        aria-hidden
-      />
     </div>
   );
 }

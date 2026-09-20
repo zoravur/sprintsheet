@@ -2,7 +2,6 @@ export { CanvasDataGrid, type CanvasDataGridProps, type GridStats } from "./Canv
 export { Axis } from "./layout";
 export { fullGrid, scanCell, type Cell, type ScanAxis } from "./navigation";
 export { drawGrid, RESIZE_HANDLE_PX } from "./renderer";
-export { computeThumb, dragScroll, thumbToScroll, type ThumbMetrics } from "./scrollbar";
 export {
   computeView,
   editTextFor,
