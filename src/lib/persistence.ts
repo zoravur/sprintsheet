@@ -9,11 +9,10 @@
  *  - `views.sql` — the `CREATE VIEW …` statements read back from the catalog.
  *
  * On load the Parquet files are re-registered and each table is recreated with
- * `read_parquet`, then the view statements are replayed. All helpers here are
- * pure (string/statement construction + parsing) so they unit-test cleanly.
+ * `read_parquet`, then the view statements are replayed. The helpers here are
+ * pure (file naming + statement parsing) so they unit-test cleanly; the
+ * statements themselves are built in `./sql` and executed in `./duckdb`.
  */
-
-import { quoteIdentifier } from "./sql";
 
 export const VIEWS_SQL_FILE = "views.sql";
 
@@ -26,20 +25,6 @@ export interface SavedView {
 /** The Parquet filename for a base relation. */
 export function parquetFile(relation: string): string {
   return `${relation}.parquet`;
-}
-
-/** `COPY "<relation>" TO '<relation>.parquet' (FORMAT PARQUET)` */
-export function copyToParquetStatement(relation: string): string {
-  return `COPY ${quoteIdentifier(relation)} TO '${parquetFile(relation)}' (FORMAT PARQUET)`;
-}
-
-/** `CREATE OR REPLACE TABLE "<relation>" AS SELECT * FROM read_parquet('<file>')` */
-export function buildTableStatements(relations: readonly string[]): string[] {
-  return relations.map(
-    (relation) =>
-      `CREATE OR REPLACE TABLE ${quoteIdentifier(relation)} AS ` +
-      `SELECT * FROM read_parquet('${parquetFile(relation)}')`,
-  );
 }
 
 /**

@@ -30,7 +30,7 @@ requests supported). On first paint the browser:
    `node_modules` under `/duckdb/*` (see `src/index.ts`),
 2. registers each relation with `registerFileURL(..., DuckDBDataProtocol.HTTP)`
    so DuckDB reads the CSVs directly from the Bun server, and
-3. loads each CSV into a table and runs the bare `FROM "<relation>"` short form,
+3. loads each CSV into a table and runs a `SELECT * FROM "<relation>"` query,
    turning the Arrow result into grid rows.
 
 ### Test databases
@@ -44,9 +44,10 @@ URL param (the header shows a link per database):
 | `?db=shop`       | `products` + `sales` — joinable on `sales.productId = products.id` |
 
 Each relation of the selected database is a tab at the bottom of the grid;
-clicking a tab runs `FROM "<relation>"`. Columns are derived from the query's
-Arrow schema (`src/lib/arrow.ts`). The query is fixed to the active relation
-(shown, not edited); use the tabs to switch relations and **Run** to re-fetch.
+clicking a tab runs `SELECT * FROM "<relation>"`. Columns are derived from the
+query's Arrow schema (`src/lib/arrow.ts`). The query is fixed to the active
+relation (shown, not edited); use the tabs to switch relations and **Run** to
+re-fetch.
 
 ### Editing
 
@@ -55,11 +56,13 @@ database. Committing an inline cell edit (double-click, `F2`, or start typing)
 runs
 
 ```sql
-UPDATE "<relation>" SET "<column>" = <value> WHERE "<primaryKey>" = <pkValue>
+UPDATE "<relation>" SET "<column>" = ? WHERE "<primaryKey>" = ?
 ```
 
-Each relation declares its `primaryKey` in `src/lib/databases.ts`; the statement
-is built by `buildCellUpdate` in `src/lib/sql.ts`.
+with the new value and the row's key bound as parameters. Each relation declares
+its `primaryKey` in `src/lib/databases.ts`; the statement is a canned template in
+`src/lib/sql.ts`, and `updateCell` in `src/lib/duckdb.ts` quotes the identifiers
+with DuckDB and binds the values.
 
 ### Ad-hoc views
 
@@ -70,9 +73,9 @@ A view has no primary key, so its results are **read-only**:
 (`getValue` only), which is the grid's marker for a non-editable cell.
 
 Double-click a view tab to name it. On commit the view is persisted in the
-DuckDB catalog via `CREATE OR REPLACE VIEW "<name>" AS <query>`
-(`buildCreateView` in `src/lib/sql.ts`), so it can be queried by name like any
-other relation.
+DuckDB catalog via a canned `CREATE OR REPLACE VIEW "<name>" AS <query>`
+prepared statement (`createView` in `src/lib/duckdb.ts`), so it can be queried
+by name like any other relation.
 
 ### Persistence
 
@@ -98,6 +101,17 @@ Regenerate the (deterministic) CSVs with:
 ```bash
 bun run scripts/generate-data.ts
 ```
+
+## Query construction
+
+Statements are built in `src/lib/sql.ts` and run in `src/lib/duckdb.ts`.
+SELECTs are assembled as DuckDB JSON ASTs (`selectAllFrom`, `selectIdentifier`)
+and rendered back to SQL by DuckDB itself via `json_deserialize_sql`, so
+identifiers and literals never go through hand-rolled quoting. DuckDB's JSON
+(de)serializer only understands SELECT, so the write statements (`UPDATE`,
+`CREATE VIEW`, `COPY … TO`, `CREATE TABLE … AS`) are canned templates executed
+as prepared statements: identifiers are quoted by DuckDB and every value is
+bound as a `?` parameter.
 
 ## DuckDB serialization types
 

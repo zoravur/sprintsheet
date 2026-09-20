@@ -12,11 +12,17 @@
  *   4. `query()` returns an Arrow table which `resultSetFromArrow` flattens
  *      into grid columns + rows.
  *
+ * Statements come from `./sql`: SELECTs are built as DuckDB JSON ASTs and
+ * rendered back to SQL with `json_deserialize_sql` (`deserializeSql` below),
+ * while the writes DuckDB can't express as JSON — `UPDATE`, `CREATE VIEW`,
+ * `COPY … TO`, `CREATE TABLE … AS` — are fixed prepared statements with their
+ * values bound (`?`) and their identifiers quoted by DuckDB itself.
+ *
  * Persistence uses DuckDB's own files rather than a JSON snapshot: each table is
  * dumped to Parquet (`COPY … TO`, so dates/timestamps keep their exact type) and
  * the view definitions to `views.sql`. Those files are uploaded to the Bun
  * server and re-loaded (`read_parquet` + replay) on the next visit; see
- * `src/lib/persistence.ts` for the statement helpers.
+ * `src/lib/persistence.ts` for the file helpers.
  *
  * Each database id gets its own wasm instance, created once and reused.
  */
@@ -29,8 +35,6 @@ import { type Relation, type TestDatabase } from "./databases";
 import type { SelectStatement } from "./duckdb-serialization.gen";
 import { DUCKDB_ASSET_PREFIX, dataUrlFor } from "./paths";
 import {
-  buildTableStatements,
-  copyToParquetStatement,
   parquetFile,
   parseStatements,
   parseViewStatement,
@@ -38,7 +42,14 @@ import {
   VIEWS_SQL_FILE,
   type SavedView,
 } from "./persistence";
-import { buildCellUpdate, buildCreateView, quoteIdentifier, sqlLiteral } from "./sql";
+import {
+  copyToParquetStatement,
+  createTableFromCsvStatement,
+  createTableFromParquetStatement,
+  createViewStatement,
+  selectIdentifier,
+  updateCellStatement,
+} from "./sql";
 
 /** Where this browser should load each DuckDB wasm bundle from. */
 const LOCAL_BUNDLES: duckdb.DuckDBBundles = {
@@ -93,6 +104,75 @@ async function putSavedFile(databaseId: string, file: string, bytes: Uint8Array)
   if (!response.ok) throw new Error(`Failed to save ${file} (${response.status})`);
 }
 
+// ---- canned statements + identifier quoting --------------------------------
+
+/** Run a canned statement, binding `params` to its `?` markers. */
+async function runPrepared(
+  connection: duckdb.AsyncDuckDBConnection,
+  statement: string,
+  ...params: unknown[]
+): Promise<void> {
+  const prepared = await connection.prepare(statement);
+  try {
+    await prepared.query(...params);
+  } finally {
+    await prepared.close();
+  }
+}
+
+/** DuckDB's identifier quoting is deterministic, so cache the rendered names. */
+const quotedIdentifiers = new Map<string, string>();
+
+/**
+ * Quote `name` as a SQL identifier by asking DuckDB to render a one-column
+ * `SELECT <name>` AST back to SQL. Delegating to DuckDB keeps identifier
+ * escaping out of our own code.
+ */
+async function quotedIdentifier(connection: duckdb.AsyncDuckDBConnection, name: string): Promise<string> {
+  const cached = quotedIdentifiers.get(name);
+  if (cached !== undefined) return cached;
+  const rendered = await renderSelect(connection, selectIdentifier(name));
+  const match = /^SELECT\s+(.*)$/s.exec(rendered);
+  if (!match) throw new Error(`Could not render identifier ${JSON.stringify(name)}`);
+  const quoted = match[1]!.trim();
+  quotedIdentifiers.set(name, quoted);
+  return quoted;
+}
+
+// ---- JSON AST <-> SQL ------------------------------------------------------
+
+/**
+ * Render a SELECT AST to SQL with DuckDB's own `json_deserialize_sql`.
+ *
+ * The statement is wrapped in the `{ error: false, statements: [...] }` envelope
+ * `json_serialize_sql` produces and bound as a `?` parameter, so it never gets
+ * concatenated into the query text.
+ */
+async function renderSelect(connection: duckdb.AsyncDuckDBConnection, statement: SelectStatement): Promise<string> {
+  const json = JSON.stringify({ error: false, statements: [statement] });
+  const prepared = await connection.prepare(`SELECT json_deserialize_sql(?) AS sql`);
+  try {
+    const value = (await prepared.query(json)).getChildAt(0)?.get(0);
+    if (value === null || value === undefined) {
+      throw new Error("json_deserialize_sql returned no value");
+    }
+    return String(value);
+  } finally {
+    await prepared.close();
+  }
+}
+
+/** Build a SELECT from a JSON AST (`./sql`) and render it back to SQL. */
+export async function deserializeSql(db: TestDatabase, statement: SelectStatement): Promise<string> {
+  const instance = await getDatabase(db);
+  const connection = await instance.connect();
+  try {
+    return await renderSelect(connection, statement);
+  } finally {
+    await connection.close();
+  }
+}
+
 // ---- boot ------------------------------------------------------------------
 
 async function bootstrap(db: TestDatabase): Promise<Booted> {
@@ -117,8 +197,12 @@ async function bootstrap(db: TestDatabase): Promise<Booted> {
         if (!bytes) throw new Error(`Saved database is missing ${file}`);
         await instance.registerFileBuffer(file, bytes);
       }
-      for (const statement of buildTableStatements(db.relations.map((relation) => relation.name))) {
-        await connection.query(statement);
+      for (const relation of db.relations) {
+        await runPrepared(
+          connection,
+          createTableFromParquetStatement(await quotedIdentifier(connection, relation.name)),
+          parquetFile(relation.name),
+        );
       }
 
       const views: SavedView[] = [];
@@ -139,9 +223,10 @@ async function bootstrap(db: TestDatabase): Promise<Booted> {
       await instance.registerFileURL(relation.file, url, duckdb.DuckDBDataProtocol.HTTP, false);
     }
     for (const relation of db.relations) {
-      await connection.query(
-        `CREATE OR REPLACE TABLE ${quoteIdentifier(relation.name)} AS ` +
-          `SELECT * FROM read_csv_auto('${relation.file}')`,
+      await runPrepared(
+        connection,
+        createTableFromCsvStatement(await quotedIdentifier(connection, relation.name)),
+        relation.file,
       );
     }
     return { instance, views: [] };
@@ -197,20 +282,24 @@ export type DuckDBParseResult = DuckDBParseSuccess | DuckDBParseError;
  *
  * `json_serialize_sql(varchar)` runs the statement through DuckDB's own parser
  * and returns the serialized parse tree as a JSON string (or, when the SQL does
- * not parse, an object with `error: true`). The statement is bound as a quoted
- * literal; the JSON is parsed and returned as a `DuckDBParseResult`, narrowed
+ * not parse, an object with `error: true`). The statement is bound as a `?`
+ * parameter; the JSON is parsed and returned as a `DuckDBParseResult`, narrowed
  * on its `error` flag.
  */
 export async function duckdbParse(db: TestDatabase, sql: string): Promise<DuckDBParseResult> {
   const instance = await getDatabase(db);
   const connection = await instance.connect();
   try {
-    const table = await connection.query(`SELECT json_serialize_sql(${sqlLiteral(sql)}) AS ast`);
-    const serialized = table.getChildAt(0)?.get(0);
-    if (serialized === null || serialized === undefined) {
-      throw new Error("json_serialize_sql returned no value");
+    const prepared = await connection.prepare(`SELECT json_serialize_sql(?) AS ast`);
+    try {
+      const serialized = (await prepared.query(sql)).getChildAt(0)?.get(0);
+      if (serialized === null || serialized === undefined) {
+        throw new Error("json_serialize_sql returned no value");
+      }
+      return JSON.parse(String(serialized)) as DuckDBParseResult;
+    } finally {
+      await prepared.close();
     }
-    return JSON.parse(String(serialized)) as DuckDBParseResult;
   } finally {
     await connection.close();
   }
@@ -233,20 +322,12 @@ export async function query(db: TestDatabase, sql: string, options: QueryOptions
   }
 }
 
-/** Run a statement that produces no rows to render (DDL / UPDATE). */
-export async function execute(db: TestDatabase, sql: string): Promise<void> {
-  const instance = await getDatabase(db);
-  const connection = await instance.connect();
-  try {
-    await connection.query(sql);
-  } finally {
-    await connection.close();
-  }
-}
-
 /**
  * Persist a single cell edit to the backing table:
- * `UPDATE <relation> SET <column> = <value> WHERE <primaryKey> = <pkValue>`.
+ * `UPDATE <relation> SET <column> = ? WHERE <primaryKey> = ?`.
+ *
+ * The identifiers are quoted by DuckDB and the two values are bound, so nothing
+ * here is escaped by hand.
  */
 export async function updateCell(
   db: TestDatabase,
@@ -255,16 +336,34 @@ export async function updateCell(
   columnId: string,
   value: CellValue,
 ): Promise<void> {
-  await execute(
-    db,
-    buildCellUpdate({
-      relation: relation.name,
-      primaryKey: relation.primaryKey,
-      primaryKeyValue,
-      column: columnId,
-      value,
-    }),
-  );
+  const instance = await getDatabase(db);
+  const connection = await instance.connect();
+  try {
+    const relationName = await quotedIdentifier(connection, relation.name);
+    const columnName = await quotedIdentifier(connection, columnId);
+    const primaryKey = await quotedIdentifier(connection, relation.primaryKey);
+    await runPrepared(connection, updateCellStatement(relationName, columnName, primaryKey), value, primaryKeyValue);
+  } finally {
+    await connection.close();
+  }
+}
+
+/**
+ * Persist a named view into the DuckDB catalog:
+ * `CREATE OR REPLACE VIEW <name> AS <query>`.
+ *
+ * A trailing `;` on the query is stripped so it can be embedded after `AS`.
+ */
+export async function createView(db: TestDatabase, name: string, query: string): Promise<void> {
+  const instance = await getDatabase(db);
+  const connection = await instance.connect();
+  try {
+    const quotedName = await quotedIdentifier(connection, name);
+    const body = query.trim().replace(/;+\s*$/, "");
+    await runPrepared(connection, createViewStatement(quotedName, body));
+  } finally {
+    await connection.close();
+  }
 }
 
 /**
@@ -283,7 +382,7 @@ export async function saveDatabase(db: TestDatabase): Promise<void> {
         /* file wasn't there */
       }
       await instance.registerEmptyFileBuffer(file);
-      await connection.query(copyToParquetStatement(relation.name));
+      await runPrepared(connection, copyToParquetStatement(await quotedIdentifier(connection, relation.name)), file);
       await putSavedFile(db.id, file, await instance.copyFileToBuffer(file));
     }
 

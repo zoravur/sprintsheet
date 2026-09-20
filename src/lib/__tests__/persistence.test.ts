@@ -1,8 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  buildTableStatements,
-  copyToParquetStatement,
   parquetFile,
   parseStatements,
   parseViewStatement,
@@ -12,21 +10,6 @@ import {
 describe("parquetFile", () => {
   test("appends a .parquet extension", () => {
     expect(parquetFile("sales")).toBe("sales.parquet");
-  });
-});
-
-describe("copyToParquetStatement", () => {
-  test("builds a COPY ... TO parquet statement", () => {
-    expect(copyToParquetStatement("sales")).toBe(`COPY "sales" TO 'sales.parquet' (FORMAT PARQUET)`);
-  });
-});
-
-describe("buildTableStatements", () => {
-  test("recreates each table from its parquet file", () => {
-    expect(buildTableStatements(["sales", "products"])).toEqual([
-      `CREATE OR REPLACE TABLE "sales" AS SELECT * FROM read_parquet('sales.parquet')`,
-      `CREATE OR REPLACE TABLE "products" AS SELECT * FROM read_parquet('products.parquet')`,
-    ]);
   });
 });
 

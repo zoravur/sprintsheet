@@ -6,9 +6,18 @@ import type { CellValue, ColumnDef } from "@/components/datagrid/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { DataRow } from "@/lib/arrow";
-import { resolveDatabase, selectQuery, TEST_DATABASES, type TestDatabase } from "@/lib/databases";
-import { execute, getRestoredViews, query, saveDatabase, updateCell, type QueryResult } from "@/lib/duckdb";
-import { buildCreateView } from "@/lib/sql";
+import { resolveDatabase, TEST_DATABASES, type TestDatabase } from "@/lib/databases";
+import type { SelectStatement } from "@/lib/duckdb-serialization.gen";
+import {
+  createView,
+  deserializeSql,
+  getRestoredViews,
+  query,
+  saveDatabase,
+  updateCell,
+  type QueryResult,
+} from "@/lib/duckdb";
+import { selectAllFrom } from "@/lib/sql";
 import { cn } from "@/lib/utils";
 import "./index.css";
 
@@ -39,7 +48,7 @@ interface QueryRunner {
   status: QueryStatus;
   error: string | null;
   /** Resolves `true` when the statement ran successfully (fresh, not stale). */
-  run: (statement: string, options: { readOnly: boolean }) => Promise<boolean>;
+  run: (statement: string | SelectStatement, options: { readOnly: boolean }) => Promise<boolean>;
 }
 
 /** Executes SQL, tagging the result editable (relation) or read-only (view). */
@@ -51,24 +60,29 @@ function useQueryRunner(db: TestDatabase): QueryRunner {
   const runId = React.useRef(0);
 
   const run = React.useCallback(
-    (statement: string, options: { readOnly: boolean }): Promise<boolean> => {
-      const text = statement.trim();
+    (statement: string | SelectStatement, options: { readOnly: boolean }): Promise<boolean> => {
       const id = ++runId.current;
-      setSql(text);
       setError(null);
-      if (!text) {
-        // Blank query (a fresh view): clear the grid, nothing to run.
-        setResult(null);
-        setStatus("ready");
-        return Promise.resolve(true);
-      }
-      setStatus("running");
-      return query(db, text, { readOnly: options.readOnly })
-        .then((next) => {
+      // A built SELECT is rendered to SQL by DuckDB first; a string is already SQL.
+      const pending =
+        typeof statement === "string" ? Promise.resolve(statement.trim()) : deserializeSql(db, statement);
+      return pending
+        .then((text) => {
           if (runId.current !== id) return false;
-          setResult(next);
-          setStatus("ready");
-          return true;
+          setSql(text);
+          if (!text) {
+            // Blank query (a fresh view): clear the grid, nothing to run.
+            setResult(null);
+            setStatus("ready");
+            return true;
+          }
+          setStatus("running");
+          return query(db, text, { readOnly: options.readOnly }).then((next) => {
+            if (runId.current !== id) return false;
+            setResult(next);
+            setStatus("ready");
+            return true;
+          });
         })
         .catch((cause: unknown) => {
           if (runId.current !== id) return false;
@@ -212,7 +226,7 @@ export function App() {
     (name: string, statement: string): Promise<void> => {
       const trimmedName = name.trim();
       if (!trimmedName || !statement.trim()) return Promise.resolve();
-      return execute(db, buildCreateView(trimmedName, statement))
+      return createView(db, trimmedName, statement)
         .then(() => {
           setViewError(null);
           scheduleSave();
@@ -237,7 +251,7 @@ export function App() {
   const activeKey = active.kind === "relation" ? `relation:${active.name}` : `view:${active.id}`;
   React.useEffect(() => {
     if (active.kind === "relation") {
-      void run(selectQuery(active.name), { readOnly: false });
+      void run(selectAllFrom(active.name), { readOnly: false });
       return;
     }
     const target = viewsRef.current.find((v) => v.id === active.id);
@@ -290,7 +304,7 @@ export function App() {
 
   const handleRun = () => {
     if (active.kind === "relation") {
-      void run(selectQuery(active.name), { readOnly: false });
+      void run(selectAllFrom(active.name), { readOnly: false });
       return;
     }
     if (view) runView(view);

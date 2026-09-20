@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { allDataFiles, resolveDatabase, selectQuery, TEST_DATABASES } from "../databases";
+import { allDataFiles, resolveDatabase, TEST_DATABASES } from "../databases";
 
 describe("resolveDatabase", () => {
   test("finds databases by id", () => {
@@ -37,13 +37,6 @@ describe("registry shape", () => {
         expect(relation.primaryKey).toBe("id");
       }
     }
-  });
-});
-
-describe("selectQuery", () => {
-  test("builds a bare FROM <relation> statement with a quoted identifier", () => {
-    expect(selectQuery("test")).toBe('FROM "test"');
-    expect(selectQuery("products")).toBe('FROM "products"');
   });
 });
 

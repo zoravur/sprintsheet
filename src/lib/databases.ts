@@ -9,8 +9,6 @@
  * and the browser bundle (to know what to register) can import it.
  */
 
-import { quoteIdentifier } from "./sql";
-
 export interface Relation {
   /** Relation name used inside SQL and shown on the tab strip. */
   name: string;
@@ -58,9 +56,4 @@ export function resolveDatabase(id: string | null | undefined): TestDatabase {
 /** Every CSV the server needs to expose, across all databases. */
 export function allDataFiles(): string[] {
   return TEST_DATABASES.flatMap((db) => db.relations.map((relation) => relation.file));
-}
-
-/** The default statement for a relation, e.g. `FROM "products"`. */
-export function selectQuery(relation: string): string {
-  return `FROM ${quoteIdentifier(relation)}`;
 }
