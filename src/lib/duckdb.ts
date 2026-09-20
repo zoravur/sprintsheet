@@ -283,14 +283,15 @@ export type DuckDBParseResult = DuckDBParseSuccess | DuckDBParseError;
  * `json_serialize_sql(varchar)` runs the statement through DuckDB's own parser
  * and returns the serialized parse tree as a JSON string (or, when the SQL does
  * not parse, an object with `error: true`). The statement is bound as a `?`
- * parameter; the JSON is parsed and returned as a `DuckDBParseResult`, narrowed
- * on its `error` flag.
+ * parameter (cast to `VARCHAR` because the function checks its argument's type
+ * at bind time); the JSON is parsed and returned as a `DuckDBParseResult`,
+ * narrowed on its `error` flag.
  */
 export async function duckdbParse(db: TestDatabase, sql: string): Promise<DuckDBParseResult> {
   const instance = await getDatabase(db);
   const connection = await instance.connect();
   try {
-    const prepared = await connection.prepare(`SELECT json_serialize_sql(?) AS ast`);
+    const prepared = await connection.prepare(`SELECT json_serialize_sql(?::VARCHAR) AS ast`);
     try {
       const serialized = (await prepared.query(sql)).getChildAt(0)?.get(0);
       if (serialized === null || serialized === undefined) {
