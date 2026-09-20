@@ -100,3 +100,49 @@ export class Axis {
     return { start, end };
   }
 }
+
+/** The cell sitting at the viewport origin, plus how far into it the scroll is. */
+export interface ViewportAnchor {
+  row: number;
+  col: number;
+  /** Sub-cell pixel offset into the origin cell (0 … cell size). */
+  dx: number;
+  dy: number;
+}
+
+/**
+ * Record which cell is at the top-left of the viewport. Call this *before* the
+ * axes change, then {@link scrollForAnchor} to pin the same cell back afterward.
+ */
+export function anchorAt(colAxis: Axis, rowAxis: Axis, scrollX: number, scrollY: number): ViewportAnchor {
+  const col = colAxis.indexAt(scrollX);
+  const row = rowAxis.indexAt(scrollY);
+  return {
+    row,
+    col,
+    dx: scrollX - colAxis.offsetOf(col),
+    dy: scrollY - rowAxis.offsetOf(row),
+  };
+}
+
+/**
+ * Scroll offsets that put `anchor` back at the viewport origin under the current
+ * axes, clamped to `[0, content - viewport]` and to the valid cell range (so a
+ * column/row that no longer exists falls back to the nearest one).
+ */
+export function scrollForAnchor(
+  anchor: ViewportAnchor,
+  colAxis: Axis,
+  rowAxis: Axis,
+  viewportW: number,
+  viewportH: number,
+): { x: number; y: number } {
+  const col = Math.max(0, Math.min(colAxis.count - 1, anchor.col));
+  const row = Math.max(0, Math.min(rowAxis.count - 1, anchor.row));
+  const maxX = Math.max(0, colAxis.total - Math.max(0, viewportW));
+  const maxY = Math.max(0, rowAxis.total - Math.max(0, viewportH));
+  return {
+    x: Math.max(0, Math.min(maxX, colAxis.offsetOf(col) + anchor.dx)),
+    y: Math.max(0, Math.min(maxY, rowAxis.offsetOf(row) + anchor.dy)),
+  };
+}

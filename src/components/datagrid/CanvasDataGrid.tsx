@@ -20,7 +20,7 @@ import * as React from "react";
 
 import { cn } from "@/lib/utils";
 
-import { Axis } from "./layout";
+import { anchorAt, Axis, scrollForAnchor, type ViewportAnchor } from "./layout";
 import { drawGrid, RESIZE_HANDLE_PX } from "./renderer";
 import { clampColumnWidth, SpreadsheetModel, type Command, type Effect } from "./spreadsheet";
 import { getGridTheme, refreshGridTheme, type GridMetrics, type GridTheme } from "./theme";
@@ -109,10 +109,14 @@ export function CanvasDataGrid<Row>({
 
   // Push prop changes into the model (guarded so mount doesn't churn).
   React.useEffect(() => {
-    if (model.getState().rows !== rows) model.dispatch({ type: "setRows", rows: rows as Row[] });
+    if (model.getState().rows === rows) return;
+    captureViewportAnchor();
+    model.dispatch({ type: "setRows", rows: rows as Row[] });
   }, [model, rows]);
   React.useEffect(() => {
-    if (model.getState().columns !== columns) model.dispatch({ type: "setColumns", columns: columns as ColumnDef<Row>[] });
+    if (model.getState().columns === columns) return;
+    captureViewportAnchor();
+    model.dispatch({ type: "setColumns", columns: columns as ColumnDef<Row>[] });
   }, [model, columns]);
 
   // ---- presentational refs ------------------------------------------------
@@ -134,6 +138,7 @@ export function CanvasDataGrid<Row>({
   const resizeColRef = React.useRef(-1);
   const resizePreviewRef = React.useRef<{ col: number; width: number } | null>(null);
   const selectionNotifiedRef = React.useRef<SelectionRange | null>(null);
+  const pendingAnchorRef = React.useRef<ViewportAnchor | null>(null);
   const dragRef = React.useRef(false);
   const dragAnchorRef = React.useRef<CellAddress>({ row: 0, col: 0 });
   const resizeSessionRef = React.useRef<ResizeSession | null>(null);
@@ -158,6 +163,33 @@ export function CanvasDataGrid<Row>({
   onCellEditRef.current = onCellEdit;
   onSelectionChangeRef.current = onSelectionChange;
   metricsRef.current = { rowHeight, headerHeight, gutterWidth };
+
+  /**
+   * A new column/row set re-lays-out the axes, so the browser re-clamps and
+   * re-interprets the retained pixel offset (a scroll pixel that used to be
+   * column 4 is now column 7, or gets clamped when the content shrinks). Record
+   * the cell currently at the viewport origin — plus how far into it we are — so
+   * the same cell can be pinned back after the axis swap.
+   */
+  function captureViewportAnchor() {
+    const { colAxis, rowAxis } = snapshotRef.current;
+    pendingAnchorRef.current = anchorAt(colAxis, rowAxis, scrollRef.current.x, scrollRef.current.y);
+  }
+
+  /** Re-apply a captured anchor against the current axes (clamped to the range). */
+  function applyViewportAnchor() {
+    const pending = pendingAnchorRef.current;
+    if (!pending) return;
+    pendingAnchorRef.current = null;
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const { colAxis, rowAxis } = snapshotRef.current;
+    const { x, y } = scrollForAnchor(pending, colAxis, rowAxis, scroller.clientWidth, scroller.clientHeight);
+    scroller.scrollLeft = x;
+    scroller.scrollTop = y;
+    scrollRef.current.x = x;
+    scrollRef.current.y = y;
+  }
 
   // ---- derived layout -----------------------------------------------------
   const colAxis = React.useMemo(() => Axis.variable(state.widths), [state.widths]);
@@ -272,6 +304,7 @@ export function CanvasDataGrid<Row>({
       editing: state.editing ? { row: state.editing.row, col: state.editing.col } : null,
     };
     drawRef.current = draw;
+    applyViewportAnchor();
     positionEditor();
     scheduleDraw();
   });

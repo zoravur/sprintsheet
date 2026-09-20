@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { compareValues, formatCell, parseEditedValue, resolveValue } from "../format";
-import { Axis } from "../layout";
+import { anchorAt, Axis, scrollForAnchor } from "../layout";
 import { fullGrid, scanCell } from "../navigation";
 import { clampToRect, normalizeSelection, singleCellSelection } from "../types";
 import type { ColumnDef } from "../types";
@@ -242,6 +242,49 @@ describe("compareValues", () => {
 
   test("dates compare by time", () => {
     expect(compareValues(new Date(0), new Date(1000))).toBeLessThan(0);
+  });
+});
+
+describe("viewport anchor", () => {
+  const uniform = Axis.uniform(1000, 28);
+
+  test("captures the origin cell and the sub-cell offset", () => {
+    const anchor = anchorAt(Axis.uniform(10, 100), uniform, 250, 100);
+    expect(anchor.col).toBe(2);
+    expect(anchor.dx).toBe(50);
+    expect(anchor.row).toBe(3);
+    expect(anchor.dy).toBe(16);
+  });
+
+  test("round-trips to the same offsets when the axes are unchanged", () => {
+    const cols = Axis.variable([100, 160, 120, 100]);
+    const anchor = anchorAt(cols, uniform, 130, 100);
+    const { x, y } = scrollForAnchor(anchor, cols, uniform, 200, 200);
+    expect(x).toBe(130);
+    expect(y).toBe(100);
+  });
+
+  test("pins the same cell when columns widen", () => {
+    const before = Axis.variable([100, 100, 100, 100]);
+    const after = Axis.variable([200, 200, 200, 200]);
+    const anchor = anchorAt(before, uniform, 150, 0); // col 1, dx 50
+    expect(anchor.col).toBe(1);
+    expect(anchor.dx).toBe(50);
+    // Col 1 now starts at 200, plus the 50px into the cell.
+    expect(scrollForAnchor(anchor, after, uniform, 500, 500).x).toBe(250);
+  });
+
+  test("clamps to the new content when it shrinks below the anchor", () => {
+    const before = Axis.variable([100, 100, 100, 100]);
+    const after = Axis.variable([100, 100]);
+    const anchor = anchorAt(before, uniform, 350, 0); // col 3
+    // Col 3 no longer exists -> nearest (col 1) and clamp to maxScroll 0.
+    expect(scrollForAnchor(anchor, after, uniform, 500, 500).x).toBe(0);
+  });
+
+  test("never returns a negative offset", () => {
+    const anchor = { row: 0, col: 0, dx: -40, dy: -10 };
+    expect(scrollForAnchor(anchor, uniform, uniform, 500, 500)).toEqual({ x: 0, y: 0 });
   });
 });
 

@@ -1,5 +1,5 @@
 export { CanvasDataGrid, type CanvasDataGridProps, type GridStats } from "./CanvasDataGrid";
-export { Axis } from "./layout";
+export { anchorAt, Axis, scrollForAnchor, type ViewportAnchor } from "./layout";
 export { fullGrid, scanCell, type Cell, type ScanAxis } from "./navigation";
 export { drawGrid, RESIZE_HANDLE_PX } from "./renderer";
 export {
