@@ -464,7 +464,7 @@ describe("clearCells", () => {
       extent: { row: 1, col: 1 },
       focus: { row: 0, col: 0 },
     });
-    m.dispatch({ type: "clearCells" });
+    const effects = m.dispatch({ type: "clearCells" });
     const view = m.getState().view;
     const raw = (r: number) => view[r] as unknown as Record<string, unknown>;
     expect(raw(0)["id"]).toBe(null);
@@ -474,6 +474,10 @@ describe("clearCells", () => {
     // untouched
     expect(view[2]?.id).toBe("r2");
     expect(view[0]?.amount).toBe(0);
+    // clearing is a write: each nulled cell reports an `edited` effect
+    const edited = effects.filter((e) => e.type === "edited");
+    expect(edited).toHaveLength(4);
+    expect(edited.every((e) => e.type === "edited" && e.value === null)).toBe(true);
   });
 });
 
@@ -481,13 +485,15 @@ describe("paste", () => {
   test("writes a TSV block from the focus cell, coercing types", () => {
     const m = makeModel();
     m.dispatch({ type: "selectCell", row: 1, col: 0 });
-    m.dispatch({ type: "paste", text: "a\tb\t7\nc\td\t8" });
+    const effects = m.dispatch({ type: "paste", text: "a\tb\t7\nc\td\t8" });
     const view = m.getState().view;
     expect(view[1]?.id).toBe("a");
     expect(view[1]?.name).toBe("b");
     expect(view[1]?.amount).toBe(7);
     expect(view[2]?.id).toBe("c");
     expect(view[2]?.amount).toBe(8);
+    // each changed cell reports an `edited` effect so it can be persisted
+    expect(effects.filter((e) => e.type === "edited")).toHaveLength(6);
   });
 
   test("clips writes that run past the grid and skips read-only columns", () => {

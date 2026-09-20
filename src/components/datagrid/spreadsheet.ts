@@ -347,21 +347,26 @@ export function reduce<Row>(state: SpreadsheetState<Row>, command: Command<Row>)
       const rect = normalizeSelection(state.selection);
       const rowMax = Math.min(rect.rowMax, rowCount - 1);
       const colMax = Math.min(rect.colMax, colCount - 1);
+      const effects: Effect<Row>[] = [];
       for (let r = rect.rowMin; r <= rowMax; r++) {
         const target = state.view[r];
         if (target === undefined) continue;
         for (let c = rect.colMin; c <= colMax; c++) {
           const column = state.columns[c];
           if (!column || column.field === undefined) continue;
+          const previous = resolveValue(column, target, r);
+          if (previous === null || previous === undefined) continue; // already empty
           (target as Record<string, unknown>)[column.field] = null;
+          effects.push({ type: "edited", row: target, rowIndex: r, column, value: null, previous });
         }
       }
-      return { state: { ...state }, effects: NO_EFFECTS as Effect<Row>[] };
+      return { state: { ...state }, effects };
     }
 
     case "paste": {
       const origin = { row: state.selection.focusRow, col: state.selection.focusCol };
       const matrix = command.text.replace(/\r/g, "").split("\n").map((line) => line.split("\t"));
+      const effects: Effect<Row>[] = [];
       matrix.forEach((cells, dr) => {
         cells.forEach((cellText, dc) => {
           const r = origin.row + dr;
@@ -370,10 +375,14 @@ export function reduce<Row>(state: SpreadsheetState<Row>, command: Command<Row>)
           const column = state.columns[c];
           const target = state.view[r];
           if (!column || target === undefined || column.field === undefined) return;
-          (target as Record<string, unknown>)[column.field] = parseEditedValue(column, cellText);
+          const previous = resolveValue(column, target, r);
+          const value = parseEditedValue(column, cellText);
+          if (value === previous) return;
+          (target as Record<string, unknown>)[column.field] = value;
+          effects.push({ type: "edited", row: target, rowIndex: r, column, value, previous });
         });
       });
-      return { state: { ...state }, effects: NO_EFFECTS as Effect<Row>[] };
+      return { state: { ...state }, effects };
     }
 
     case "setRows": {

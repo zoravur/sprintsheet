@@ -6,6 +6,9 @@ out
 dist
 *.tgz
 
+# saved database files (runtime DuckDB state written by the server)
+src/data/saved
+
 # code coverage
 coverage
 *.lcov
