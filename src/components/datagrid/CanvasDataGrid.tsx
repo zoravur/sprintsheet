@@ -22,7 +22,7 @@ import { cn } from "@/lib/utils";
 
 import { Axis } from "./layout";
 import { drawGrid, RESIZE_HANDLE_PX } from "./renderer";
-import { SpreadsheetModel, type Command, type Effect } from "./spreadsheet";
+import { clampColumnWidth, SpreadsheetModel, type Command, type Effect } from "./spreadsheet";
 import { getGridTheme, refreshGridTheme, type GridMetrics, type GridTheme } from "./theme";
 import { normalizeSelection, type CellAddress, type ColumnDef, type SelectionRange, type SortState } from "./types";
 
@@ -76,6 +76,18 @@ interface ResizeSession {
 
 const NO_HOVER: CellAddress = { row: -1, col: -1 };
 
+/** Structural equality for selection ranges (the model hands back fresh objects). */
+function sameSelection(a: SelectionRange, b: SelectionRange): boolean {
+  return (
+    a.anchorRow === b.anchorRow &&
+    a.anchorCol === b.anchorCol &&
+    a.extentRow === b.extentRow &&
+    a.extentCol === b.extentCol &&
+    a.focusRow === b.focusRow &&
+    a.focusCol === b.focusCol
+  );
+}
+
 export function CanvasDataGrid<Row>({
   rows,
   columns,
@@ -103,11 +115,11 @@ export function CanvasDataGrid<Row>({
     if (model.getState().columns !== columns) model.dispatch({ type: "setColumns", columns: columns as ColumnDef<Row>[] });
   }, [model, columns]);
 
-  // ---- presentational state ----------------------------------------------
-  const [hover, setHover] = React.useState<CellAddress>(NO_HOVER);
-  const [resizeCol, setResizeCol] = React.useState(-1);
-  const [scrollState, setScrollState] = React.useState({ x: 0, y: 0 });
-
+  // ---- presentational refs ------------------------------------------------
+  // Hover, the resize-in-progress column and its preview width change on the
+  // interaction hot path, and only the canvas (plus the imperatively positioned
+  // editor) read them. They are refs, not React state: routing them through a
+  // render would be pure overhead.
   const wrapperRef = React.useRef<HTMLDivElement>(null);
   const scrollerRef = React.useRef<HTMLDivElement>(null);
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
@@ -120,6 +132,8 @@ export function CanvasDataGrid<Row>({
   const metricsRef = React.useRef<GridMetrics>({ rowHeight, headerHeight, gutterWidth });
   const hoverRef = React.useRef<CellAddress>(NO_HOVER);
   const resizeColRef = React.useRef(-1);
+  const resizePreviewRef = React.useRef<{ col: number; width: number } | null>(null);
+  const selectionNotifiedRef = React.useRef<SelectionRange | null>(null);
   const dragRef = React.useRef(false);
   const dragAnchorRef = React.useRef<CellAddress>({ row: 0, col: 0 });
   const resizeSessionRef = React.useRef<ResizeSession | null>(null);
@@ -149,9 +163,30 @@ export function CanvasDataGrid<Row>({
   const colAxis = React.useMemo(() => Axis.variable(state.widths), [state.widths]);
   const rowAxis = React.useMemo(() => Axis.uniform(state.view.length, rowHeight), [state.view.length, rowHeight]);
 
+  /** The committed column axis, or one with the in-progress resize preview applied. */
+  const effectiveColAxis = React.useCallback((): Axis => {
+    const preview = resizePreviewRef.current;
+    if (!preview) return colAxis;
+    const widths = state.widths.slice();
+    widths[preview.col] = preview.width;
+    return Axis.variable(widths);
+  }, [colAxis, state.widths]);
+
   // ---- imperative draw ----------------------------------------------------
   const drawRef = React.useRef<() => void>(() => {});
   const rafRef = React.useRef(0);
+
+  /** Keep the DOM editor glued to its cell without going through React. */
+  const positionEditor = React.useCallback(() => {
+    const input = editorRef.current;
+    const snap = snapshotRef.current;
+    if (!input || !snap.editing) return;
+    const { gutterWidth: gw, headerHeight: hh } = metricsRef.current;
+    input.style.left = `${gw + snap.colAxis.offsetOf(snap.editing.col) - scrollRef.current.x}px`;
+    input.style.top = `${hh + snap.rowAxis.offsetOf(snap.editing.row) - scrollRef.current.y}px`;
+    input.style.width = `${snap.colAxis.sizeOf(snap.editing.col)}px`;
+    input.style.height = `${snap.rowAxis.sizeOf(snap.editing.row)}px`;
+  }, []);
 
   const draw = React.useCallback(() => {
     const ctx = ctxRef.current;
@@ -182,6 +217,14 @@ export function CanvasDataGrid<Row>({
     const bodyW = Math.max(0, sizeRef.current.w - metricsRef.current.gutterWidth);
     const rows = snap.rowAxis.visibleRange(scrollRef.current.y, bodyH, 0);
     const cols = snap.colAxis.visibleRange(scrollRef.current.x, bodyW, 0);
+    positionEditor();
+    // Coalesce selection notifications into the frame rather than firing them on
+    // every pointer move.
+    const notified = selectionNotifiedRef.current;
+    if (!notified || !sameSelection(notified, snap.selection)) {
+      selectionNotifiedRef.current = snap.selection;
+      onSelectionChangeRef.current?.(snap.selection);
+    }
     const now = performance.now();
     if (now - lastStatsRef.current > 200) {
       lastStatsRef.current = now;
@@ -193,7 +236,7 @@ export function CanvasDataGrid<Row>({
         lastCol: Math.max(cols.start, cols.end - 1),
       });
     }
-  }, []);
+  }, [positionEditor]);
 
   const scheduleDraw = React.useCallback(() => {
     if (rafRef.current !== 0) return;
@@ -208,24 +251,28 @@ export function CanvasDataGrid<Row>({
     if (!scroller) return;
     scrollRef.current.x = scroller.scrollLeft;
     scrollRef.current.y = scroller.scrollTop;
-    if (model.getState().editing) setScrollState({ x: scroller.scrollLeft, y: scroller.scrollTop });
     scheduleDraw();
-  }, [model, scheduleDraw]);
+  }, [scheduleDraw]);
 
   // Refresh the draw snapshot after every render, then queue a paint.
   React.useLayoutEffect(() => {
+    // A marquee is previewed on the snapshot (not the model), so a re-render that
+    // lands mid-drag — App's selection/stat state, say — must not overwrite it
+    // with the model's still-collapsed selection.
+    const liveSelection = snapshotRef.current.selection;
     snapshotRef.current = {
       columns: state.columns as readonly ColumnDef<any>[],
       rows: state.view as readonly any[],
-      colAxis,
+      colAxis: effectiveColAxis(),
       rowAxis,
-      selection: state.selection,
+      selection: dragRef.current ? liveSelection : state.selection,
       sort: state.sort,
-      hover,
+      hover: hoverRef.current,
       resizeCol: resizeColRef.current,
       editing: state.editing ? { row: state.editing.row, col: state.editing.col } : null,
     };
     drawRef.current = draw;
+    positionEditor();
     scheduleDraw();
   });
 
@@ -353,14 +400,6 @@ export function CanvasDataGrid<Row>({
     return () => el.removeEventListener("wheel", onWheel);
   }, [syncScroll]);
 
-  // ---- selection-change notification --------------------------------------
-  const prevSelectionRef = React.useRef<SelectionRange | null>(null);
-  React.useEffect(() => {
-    if (prevSelectionRef.current === state.selection) return;
-    prevSelectionRef.current = state.selection;
-    onSelectionChangeRef.current?.(state.selection);
-  }, [state.selection]);
-
   // ---- editing editor focus ----------------------------------------------
   const editingKey = state.editing ? `${state.editing.row}:${state.editing.col}` : null;
   React.useEffect(() => {
@@ -397,7 +436,7 @@ export function CanvasDataGrid<Row>({
       if (Math.abs(x - rightEdge) <= RESIZE_HANDLE_PX) {
         resizeSessionRef.current = { col, startX: event.clientX, startWidth: colAxis.sizeOf(col) };
         resizeColRef.current = col;
-        setResizeCol(col);
+        snapshotRef.current.resizeCol = col;
         scheduleDraw();
         return;
       }
@@ -423,14 +462,29 @@ export function CanvasDataGrid<Row>({
     const cell = cellAt(x, y);
     dragAnchorRef.current = cell;
     dragRef.current = mouse;
+    // Collapse the snapshot too, so a press without a drag — and the mid-drag
+    // re-render guard — both see the pressed cell rather than the previous range.
+    snapshotRef.current.selection = {
+      anchorRow: cell.row,
+      anchorCol: cell.col,
+      extentRow: cell.row,
+      extentCol: cell.col,
+      focusRow: cell.row,
+      focusCol: cell.col,
+    };
     run({ type: "selectCell", row: cell.row, col: cell.col });
   };
 
   const handlePointerMove = (event: React.PointerEvent<HTMLElement>) => {
     const resize = resizeSessionRef.current;
     if (resize) {
-      const width = resize.startWidth + (event.clientX - resize.startX);
-      run({ type: "setColumnWidth", col: resize.col, width });
+      // Preview only: the width is held in a ref and merged into the column axis
+      // for this frame. The model is touched once, on pointer up.
+      const column = state.columns[resize.col];
+      const raw = resize.startWidth + (event.clientX - resize.startX);
+      resizePreviewRef.current = { col: resize.col, width: column ? clampColumnWidth(column, raw) : raw };
+      snapshotRef.current.colAxis = effectiveColAxis();
+      scheduleDraw();
       return;
     }
 
@@ -440,36 +494,50 @@ export function CanvasDataGrid<Row>({
       if (x < gutterWidth || y < headerHeight) return;
       const cell = cellAt(x, y);
       const anchor = dragAnchorRef.current;
-      run({ type: "selectRange", anchor, extent: cell, focus: anchor });
+      // Preview the range on the snapshot; commit it to the model on pointer up.
+      snapshotRef.current.selection = {
+        anchorRow: anchor.row,
+        anchorCol: anchor.col,
+        extentRow: cell.row,
+        extentCol: cell.col,
+        focusRow: anchor.row,
+        focusCol: anchor.col,
+      };
+      scheduleDraw();
       return;
     }
 
     const row = y >= headerHeight ? rowAxis.indexAt(scrollRef.current.y + (y - headerHeight)) : -1;
     const col = x >= gutterWidth ? colAxis.indexAt(scrollRef.current.x + (x - gutterWidth)) : -1;
-    if (row !== hover.row || col !== hover.col) {
+    if (row !== hoverRef.current.row || col !== hoverRef.current.col) {
       const next = { row, col };
       hoverRef.current = next;
-      setHover(next);
+      snapshotRef.current.hover = next;
+      scheduleDraw();
     }
   };
 
   const handlePointerUp = (event: React.PointerEvent<HTMLElement>) => {
     if (resizeSessionRef.current) {
+      const preview = resizePreviewRef.current;
       resizeSessionRef.current = null;
       resizeColRef.current = -1;
-      setResizeCol(-1);
+      resizePreviewRef.current = null;
+      snapshotRef.current.resizeCol = -1;
+      // Commit the previewed width. `setColumnWidth` is a no-op if unchanged.
+      if (preview) run({ type: "setColumnWidth", col: preview.col, width: preview.width });
       scheduleDraw();
     }
     if (dragRef.current) {
-      // The gesture is over — anchor and extent are interchangeable, so
-      // normalise anchor to the top-left and extent to the bottom-right.
-      const sel = model.getState().selection;
-      const rect = normalizeSelection(sel);
+      // Commit the range that was previewed on the snapshot, normalised so the
+      // anchor is the top-left and the extent the bottom-right.
+      const live = normalizeSelection(snapshotRef.current.selection);
+      const anchor = dragAnchorRef.current;
       run({
         type: "selectRange",
-        anchor: { row: rect.rowMin, col: rect.colMin },
-        extent: { row: rect.rowMax, col: rect.colMax },
-        focus: { row: sel.focusRow, col: sel.focusCol },
+        anchor: { row: live.rowMin, col: live.colMin },
+        extent: { row: live.rowMax, col: live.colMax },
+        focus: { row: anchor.row, col: anchor.col },
       });
     }
     dragRef.current = false;
@@ -486,7 +554,8 @@ export function CanvasDataGrid<Row>({
     if (dragRef.current) return;
     if (hoverRef.current.row === -1 && hoverRef.current.col === -1) return;
     hoverRef.current = NO_HOVER;
-    setHover(NO_HOVER);
+    snapshotRef.current.hover = NO_HOVER;
+    scheduleDraw();
   };
 
   const handleDoubleClick = (event: React.MouseEvent<HTMLElement>) => {
@@ -625,21 +694,19 @@ export function CanvasDataGrid<Row>({
     run(command);
   };
 
-  // ---- editor overlay position -------------------------------------------
+  // ---- editor overlay -----------------------------------------------------
+  // Only the static parts of the editor's appearance live in React; its size and
+  // position are written imperatively by `positionEditor`, so scrolling (and the
+  // editor tracking it) never re-renders the component.
   const editor = state.editing;
-  const editorStyle = React.useMemo<React.CSSProperties | undefined>(() => {
-    if (!editor) return undefined;
-    const column = state.columns[editor.col];
-    const align = column?.align ?? (column && ["number", "integer", "currency", "percent"].includes(column.type ?? "") ? "right" : "left");
-    return {
-      left: gutterWidth + colAxis.offsetOf(editor.col) - scrollState.x,
-      top: headerHeight + rowAxis.offsetOf(editor.row) - scrollState.y,
-      width: colAxis.sizeOf(editor.col),
-      height: rowAxis.sizeOf(editor.row),
-      padding: "0 9px",
-      textAlign: align as React.CSSProperties["textAlign"],
-    };
-  }, [editor, state.columns, colAxis, rowAxis, scrollState, gutterWidth, headerHeight]);
+  const editorColumn = editor ? state.columns[editor.col] : undefined;
+  const editorAlign =
+    editorColumn?.align ??
+    (editorColumn && ["number", "integer", "currency", "percent"].includes(editorColumn.type ?? "") ? "right" : "left");
+  const editorStyle: React.CSSProperties = {
+    padding: "0 9px",
+    textAlign: (editorAlign ?? "left") as React.CSSProperties["textAlign"],
+  };
 
   return (
     <div
@@ -681,7 +748,7 @@ export function CanvasDataGrid<Row>({
         <div style={{ width: colAxis.total, height: rowAxis.total }} aria-hidden />
       </div>
 
-      {editor && editorStyle ? (
+      {editor ? (
         /* No onKeyDown here on purpose: keys are handled once, on the wrapper. */
         <input
           ref={editorRef}

@@ -3,6 +3,7 @@ export { Axis } from "./layout";
 export { fullGrid, scanCell, type Cell, type ScanAxis } from "./navigation";
 export { drawGrid, RESIZE_HANDLE_PX } from "./renderer";
 export {
+  clampColumnWidth,
   computeView,
   editTextFor,
   initialState,

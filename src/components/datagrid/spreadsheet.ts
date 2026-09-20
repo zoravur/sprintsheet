@@ -96,6 +96,13 @@ export function computeView<Row>(rows: Row[], columns: ColumnDef<Row>[], sort: S
   return decorated.map((d) => d.row);
 }
 
+/** Clamp a column width to its declared bounds (default 56–800). */
+export function clampColumnWidth(column: ColumnDef<any>, width: number): number {
+  const min = column.minWidth ?? 56;
+  const max = column.maxWidth ?? 800;
+  return Math.max(min, Math.min(max, width));
+}
+
 function clampCell(rowCount: number, colCount: number, sel: SelectionRange): SelectionRange {
   const maxRow = Math.max(0, rowCount - 1);
   const maxCol = Math.max(0, colCount - 1);
@@ -334,9 +341,7 @@ export function reduce<Row>(state: SpreadsheetState<Row>, command: Command<Row>)
     case "setColumnWidth": {
       const column = state.columns[command.col];
       if (!column) return empty;
-      const min = column.minWidth ?? 56;
-      const max = column.maxWidth ?? 800;
-      const width = Math.max(min, Math.min(max, command.width));
+      const width = clampColumnWidth(column, command.width);
       if (state.widths[command.col] === width) return empty;
       const widths = state.widths.slice();
       widths[command.col] = width;
