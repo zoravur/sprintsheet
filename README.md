@@ -99,6 +99,33 @@ Regenerate the (deterministic) CSVs with:
 bun run scripts/generate-data.ts
 ```
 
+## DuckDB serialization types
+
+DuckDB describes how its parse tree serializes in the JSON schemas under
+`src/include/duckdb/storage/serialization`. Two scripts mirror those schemas and
+turn them into TypeScript types; both take the revision as an argument and are
+deterministic (same input → byte-identical output).
+
+```bash
+# 1. Mirror one revision of the schema directory into `schemas/duckdb/<ref>/`.
+bun run scripts/fetch-serialization-schemas.ts v1.5-variegata
+
+# 2. Generate TypeScript types from the mirrored schemas.
+bun run scripts/generate-serialization-types.ts v1.5-variegata
+```
+
+The fetch script is a GitHub mirror (pass `--owner` / `--repo` / `--path` /
+`--out` to point elsewhere; `GITHUB_TOKEN` raises the rate limit). The generate
+script emits `src/lib/duckdb-serialization.gen.ts`: one `interface` per schema
+class (members typed from their C++ types, subclassing via `extends`, the
+polymorphic discriminator narrowed to its literal), an `Any<Base>` union per
+hierarchy, and `DuckDBValue` / `DuckDBLogicalType` placeholders for types
+defined outside these schemas. A pointer or smart pointer to a class that has
+subclasses is typed as its `Any<Base>` union (it holds a concrete subclass), so
+the AST narrows on `type`; and an indirect reference (`T*`, smart pointer) is
+nullable (`| null`) because a nil pointer serializes as `null` (container
+elements are never null). See the doc comments in each script for the mapping.
+
 ## Canvas data grid
 
 `src/components/datagrid` contains a virtualized spreadsheet datatable painted

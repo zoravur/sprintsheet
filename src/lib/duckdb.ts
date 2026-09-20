@@ -26,6 +26,7 @@ import * as duckdb from "@duckdb/duckdb-wasm";
 import type { CellValue } from "@/components/datagrid/types";
 import { resultSetFromArrow, type ResultSet } from "./arrow";
 import { type Relation, type TestDatabase } from "./databases";
+import type { SelectStatement } from "./duckdb-serialization.gen";
 import { DUCKDB_ASSET_PREFIX, dataUrlFor } from "./paths";
 import {
   buildTableStatements,
@@ -37,7 +38,7 @@ import {
   VIEWS_SQL_FILE,
   type SavedView,
 } from "./persistence";
-import { buildCellUpdate, buildCreateView, quoteIdentifier } from "./sql";
+import { buildCellUpdate, buildCreateView, quoteIdentifier, sqlLiteral } from "./sql";
 
 /** Where this browser should load each DuckDB wasm bundle from. */
 const LOCAL_BUNDLES: duckdb.DuckDBBundles = {
@@ -173,11 +174,56 @@ export async function getRestoredViews(db: TestDatabase): Promise<SavedView[]> {
 
 // ---- queries + writes ------------------------------------------------------
 
+/** `json_serialize_sql` output when the SQL parsed. */
+export interface DuckDBParseSuccess {
+  error: false;
+  statements: SelectStatement[];
+}
+
+/** `json_serialize_sql` output when the SQL did not parse. */
+export interface DuckDBParseError {
+  error: true;
+  error_type: string;
+  error_message: string;
+  error_subtype?: string;
+  position?: string;
+}
+
+/** The two shapes `json_serialize_sql` can return, discriminated on `error`. */
+export type DuckDBParseResult = DuckDBParseSuccess | DuckDBParseError;
+
+/**
+ * Parse `sql` into DuckDB's JSON AST.
+ *
+ * `json_serialize_sql(varchar)` runs the statement through DuckDB's own parser
+ * and returns the serialized parse tree as a JSON string (or, when the SQL does
+ * not parse, an object with `error: true`). The statement is bound as a quoted
+ * literal; the JSON is parsed and returned as a `DuckDBParseResult`, narrowed
+ * on its `error` flag.
+ */
+export async function duckdbParse(db: TestDatabase, sql: string): Promise<DuckDBParseResult> {
+  const instance = await getDatabase(db);
+  const connection = await instance.connect();
+  try {
+    const table = await connection.query(`SELECT json_serialize_sql(${sqlLiteral(sql)}) AS ast`);
+    const serialized = table.getChildAt(0)?.get(0);
+    if (serialized === null || serialized === undefined) {
+      throw new Error("json_serialize_sql returned no value");
+    }
+    return JSON.parse(String(serialized)) as DuckDBParseResult;
+  } finally {
+    await connection.close();
+  }
+}
+
 /** Run `sql` against a database and return grid-ready columns + rows. */
 export async function query(db: TestDatabase, sql: string, options: QueryOptions = {}): Promise<QueryResult> {
   const instance = await getDatabase(db);
   const connection = await instance.connect();
   try {
+    // Parse the user's statement first and log the AST for inspection.
+    const ast = await duckdbParse(db, sql);
+    console.log(JSON.stringify(ast, null, 2));
     const started = performance.now();
     const table = await connection.query(sql);
     const elapsedMs = performance.now() - started;
