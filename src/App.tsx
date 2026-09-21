@@ -332,8 +332,6 @@ export function App() {
     if (target && name) void persistView(name, target.sql);
   };
 
-  const queryLabel = sql || (view ? view.name || "untitled view" : "");
-
   return (
     <div className="fixed inset-0 flex flex-col bg-background text-foreground">
       <header className="flex flex-wrap items-center gap-x-4 gap-y-3 border-b px-4 py-3">
@@ -341,7 +339,6 @@ export function App() {
           <h1 className="text-sm font-semibold tracking-tight">Sprintsheet</h1>
           <p className="text-xs text-muted-foreground">
             DuckDB-wasm · {db.label} · {rows.length.toLocaleString()} rows × {columns.length} columns
-            {queryLabel ? ` · ${queryLabel}` : ""}
           </p>
         </div>
 
@@ -421,30 +418,25 @@ export function App() {
       {/* Relation queries are fixed; a view holds its own editable query. */}
       <div className="flex flex-wrap items-center gap-2 border-b bg-muted/40 px-4 py-2">
         <Terminal className="size-4 shrink-0 text-muted-foreground" />
-        {view ? (
-          <Input
-            value={view.sql}
-            onChange={(event) => updateViewSql(view.id, event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                handleRun();
-              }
-            }}
-            spellCheck={false}
-            autoFocus
-            aria-label="SQL query"
-            placeholder={'Write a SQL query — e.g. SELECT * FROM "sales"'}
-            className="h-8 min-w-0 flex-1 font-mono text-xs"
-          />
-        ) : (
-          <code
-            aria-label="SQL query"
-            className="min-w-0 flex-1 truncate rounded-md border bg-background px-2 py-1 font-mono text-xs text-foreground"
-          >
-            {sql}
-          </code>
-        )}
+        {/* One field for both tab kinds: editable for views, read-only for fixed relations. */}
+        <Input
+          value={view ? view.sql : sql}
+          onChange={(event) => {
+            if (view) updateViewSql(view.id, event.target.value);
+          }}
+          onKeyDown={(event) => {
+            if (view && event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              handleRun();
+            }
+          }}
+          spellCheck={false}
+          autoFocus={view != null}
+          readOnly={view == null}
+          aria-label="SQL query"
+          placeholder={view ? 'Write a SQL query — e.g. SELECT * FROM "sales"' : undefined}
+          className="h-8 min-w-0 flex-1 font-mono text-xs"
+        />
         <Button size="sm" variant="outline" onClick={handleRun} disabled={running}>
           {running ? <Loader2 className="animate-spin" /> : <Play />}
           Run
